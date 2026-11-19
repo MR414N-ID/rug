@@ -200,9 +200,7 @@ function savePositions() {
 
 async function getCurrentPrice(mintStr) {
   try {
-    // Menggunakan getBuyPrice dari SDK
     const priceData = await sdk.fetchBuyState(new PublicKey(mintStr), wallet.publicKey);
-    // Note: ini simulasi harga sederhana, menggunakan rasio supply/curve
     return parseFloat(priceData.bondingCurve.virtualSolReserves.toString()) / parseFloat(priceData.bondingCurve.virtualTokenReserves.toString());
   } catch { return 0; }
 }
@@ -565,23 +563,39 @@ bot.action("withdraw", (ctx) => {
   return ctx.editMessageText("💰 *WITHDRAW*\n\nkirim alamat tujuan:", { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]) });
 });
 
-// --- auto monitor sniper ---
+// --- auto monitor sniper (DENGAN PENGAMAN ANTI CRASH) ---
 connection.onLogs(
   new PublicKey(PUMP_PROGRAM_ID),
   async ({ logs, signature }) => {
-    if (!logs.some((l) => l.includes("Instruction: Create"))) return;
-    const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
-    if (!tx) return;
-    const mint = (tx.meta.postTokenBalances || [])[0]?.mint;
-    if (!mint) return;
-    const dev = tx.transaction.message.accountKeys[0].toString();
     try {
+      if (!logs.some((l) => l.includes("Instruction: Create"))) return;
+      
+      const tx = await connection.getTransaction(signature, { 
+        maxSupportedTransactionVersion: 0, 
+        commitment: "confirmed" 
+      });
+      
+      if (!tx || !tx.meta || !tx.transaction || !tx.transaction.message || !tx.transaction.message.accountKeys) return;
+      
+      const mint = (tx.meta.postTokenBalances || [])[0]?.mint;
+      if (!mint) return;
+      
+      const dev = tx.transaction.message.accountKeys[0]?.toString();
+      if (!dev) return;
+
       const res = await analyze({ mint, devWallet: dev });
       TOKENS[mint] = res;
+      
       if (res.score >= SCORE_THRESHOLD && CHAT_ID) {
-        await bot.telegram.sendMessage(CHAT_ID, `🎯 *NEW SNIPE CANDIDATE*\n\`${mint}\`\nskor: ${res.score}`, { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("🎯 SNIPE", "list_snipe")]]) });
+        await bot.telegram.sendMessage(
+          CHAT_ID, 
+          `🎯 *NEW SNIPE CANDIDATE*\n\`${mint}\`\nskor: ${res.score}`, 
+          { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("🎯 SNIPE", "list_snipe")]]) }
+        );
       }
-    } catch (e) { console.error(e.message); }
+    } catch (e) {
+      console.error("Monitor skip error:", e.message);
+    }
   },
   "confirmed"
 );

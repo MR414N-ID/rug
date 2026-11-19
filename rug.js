@@ -9,9 +9,7 @@ import {
   getAssociatedTokenAddress, getOrCreateAssociatedTokenAccount,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
-import {
-  PumpSdk, buyInstructions, sellInstructions, createInstructions, getBuyPrice,
-} from "@pump-fun/pump-sdk";
+import { PumpSdk } from "@pump-fun/pump-sdk";
 import { Telegraf, Markup } from "telegraf";
 import bs58 from "bs58";
 import fetch from "node-fetch";
@@ -21,8 +19,7 @@ import fs from "fs";
 const BOT_TOKEN       = process.env.BOT_TOKEN;
 const RPC_URL         = process.env.RPC_URL;
 const PRIVATE_KEY     = process.env.WALLET_PRIVATE_KEY;
-// Default kalau env kosong: $1 setara ~0.0066 SOL
-const BUY_AMOUNT_SOL  = parseFloat(process.env.BUY_AMOUNT_SOL || "0.0066");
+const BUY_AMOUNT_SOL  = parseFloat(process.env.BUY_AMOUNT_SOL || "0.0066"); // ~$1
 const SCORE_THRESHOLD = parseInt(process.env.SCORE_THRESHOLD || "70");
 const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -123,10 +120,19 @@ async function sendIx(instructions, extraSigners = []) {
 async function buy(mintStr, solAmount) {
   const mint = new PublicKey(mintStr);
   const lamports = Math.floor(solAmount * 1e9);
-  const ix = await buyInstructions({
-    sdk, mint, buyer: wallet.publicKey,
-    amount: lamports, solAmount: BigInt(Math.floor(lamports * 1.1)), slippage: 0.1,
+  
+  const state = await sdk.fetchBuyState(mint, wallet.publicKey);
+  const ix = await sdk.buyInstructions({
+    bondingCurveAccountInfo: state.bondingCurveAccountInfo,
+    bondingCurve: state.bondingCurve,
+    associatedUserAccountInfo: state.associatedUserAccountInfo,
+    mint: mint,
+    user: wallet.publicKey,
+    solAmount: BigInt(lamports),
+    amount: BigInt(Math.floor(lamports * 1.1)),
+    slippage: 0.1,
   });
+  
   return sendIx(ix);
 }
 
@@ -136,9 +142,18 @@ async function sellAll(mintStr) {
   const info = await connection.getTokenAccountBalance(ata);
   const raw = BigInt(info.value.amount);
   if (raw === 0n) throw new Error("no token balance");
-  const ix = await sellInstructions({
-    sdk, mint, seller: wallet.publicKey, amount: raw, slippage: 0.1,
+
+  const state = await sdk.fetchSellState(mint, wallet.publicKey);
+  const ix = await sdk.sellInstructions({
+    bondingCurveAccountInfo: state.bondingCurveAccountInfo,
+    bondingCurve: state.bondingCurve,
+    associatedUserAccountInfo: state.associatedUserAccountInfo,
+    mint: mint,
+    user: wallet.publicKey,
+    amount: raw,
+    slippage: 0.1,
   });
+  
   return sendIx(ix);
 }
 
@@ -153,17 +168,17 @@ async function getTokenHoldings() {
   return holdings;
 }
 
-// ============ LAUNCHER ============
+// ============ LAUNCHER (Fitur Launch Token) ============
 async function launchToken({ name, symbol, description, imageUrl, devBuyAmt }) {
   const mintKeypair = Keypair.generate();
   const mint = mintKeypair.publicKey;
   const metadataUri = process.env.METADATA_BASE_URI
-    ? `${process.env.METADATA_BASE_URI}/${mint.toBase58()}.json` : "";
+    ? `${process.env.METADATA_BASE_URI}/${mint.toBase58()}.json` : "https://example.com/meta.json"; // Fallback
 
   await getOrCreateAssociatedTokenAccount(connection, wallet, mint, wallet.publicKey, true, undefined, undefined, TOKEN_PROGRAM_ID);
 
-  const ix = await createInstructions({
-    sdk, mint, mintAuthority: wallet.publicKey,
+  const ix = await sdk.createInstructions({
+    mint, mintAuthority: wallet.publicKey,
     name, symbol, uri: metadataUri, creator: wallet.publicKey,
   });
   const sig = await sendIx(ix, [mintKeypair]);
@@ -185,8 +200,10 @@ function savePositions() {
 
 async function getCurrentPrice(mintStr) {
   try {
-    const { price } = await getBuyPrice(connection, new PublicKey(mintStr));
-    return parseFloat(price.toString()) / 1e9;
+    // Menggunakan getBuyPrice dari SDK
+    const priceData = await sdk.fetchBuyState(new PublicKey(mintStr), wallet.publicKey);
+    // Note: ini simulasi harga sederhana, menggunakan rasio supply/curve
+    return parseFloat(priceData.bondingCurve.virtualSolReserves.toString()) / parseFloat(priceData.bondingCurve.virtualTokenReserves.toString());
   } catch { return 0; }
 }
 
@@ -210,13 +227,12 @@ async function getPnl(mint) {
 }
 
 // ============ AUTO TP/SL + TRAILING STOP ============
-// Default di-set pas buat modal kecil: TP 40%, SL -15%, Trailing 10%
 const autoState = {
-  enabled: true,          // Otomatis nyala biar aman
-  tp: 40,                 // Take Profit +40% (langsung jual)
-  sl: -15,                // Stop Loss -15% (langsung cut loss)
-  trailingEnabled: true,  // Trailing nyala
-  trailingPercent: 10,    // Kalau turun 10% dari puncak tertinggi, jual
+  enabled: true,
+  tp: 40,
+  sl: -15,
+  trailingEnabled: true,
+  trailingPercent: 10,
 };
 
 async function autoSellLoop() {
@@ -237,14 +253,9 @@ async function autoSellLoop() {
         }
 
         let reason = null;
-
         if (pnl.pnlPct >= autoState.tp) reason = "TP";
         else if (pnl.pnlPct <= autoState.sl) reason = "SL";
-        else if (
-          autoState.trailingEnabled &&
-          pos.peakPnlPct >= autoState.tp * 0.5 &&
-          pnl.pnlPct <= pos.peakPnlPct - autoState.trailingPercent
-        ) reason = "TRAILING";
+        else if (autoState.trailingEnabled && pos.peakPnlPct >= autoState.tp * 0.5 && pnl.pnlPct <= pos.peakPnlPct - autoState.trailingPercent) reason = "TRAILING";
 
         if (reason) {
           console.log(`[auto-${reason}] ${mint} ${pnl.pnlPct}%`);
@@ -429,11 +440,7 @@ bot.action("auto_menu", (ctx) => {
   const status = s.enabled ? "🟢 ON" : "🔴 OFF";
   const trail = s.trailingEnabled ? `🟢 ON (${s.trailingPercent}%)` : "🔴 OFF";
   return ctx.editMessageText(
-    `⚙️ *AUTO TP/SL/TRAILING*\n\n` +
-    `status: ${status}\n` +
-    `TP: +${s.tp}%\n` +
-    `SL: ${s.sl}%\n` +
-    `trailing: ${trail}`,
+    `⚙️ *AUTO TP/SL/TRAILING*\n\nstatus: ${status}\nTP: +${s.tp}%\nSL: ${s.sl}%\ntrailing: ${trail}`,
     {
       parse_mode: "Markdown",
       ...Markup.inlineKeyboard([
@@ -450,50 +457,33 @@ bot.action("auto_menu", (ctx) => {
 bot.action("auto_toggle", async (ctx) => {
   autoState.enabled = !autoState.enabled;
   await ctx.answerCbQuery(`auto-sell ${autoState.enabled ? "ON" : "OFF"}`);
-  return ctx.editMessageText(
-    `auto-sell sekarang: ${autoState.enabled ? "🟢 ON" : "🔴 OFF"}`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ auto menu", "auto_menu")],
-    ])
-  );
+  return ctx.editMessageText(`auto-sell sekarang: ${autoState.enabled ? "🟢 ON" : "🔴 OFF"}`, Markup.inlineKeyboard([[Markup.button.callback("⬅️ auto menu", "auto_menu")]]));
 });
 
 bot.action("trail_toggle", async (ctx) => {
   autoState.trailingEnabled = !autoState.trailingEnabled;
   await ctx.answerCbQuery(`trailing ${autoState.trailingEnabled ? "ON" : "OFF"}`);
-  return ctx.editMessageText(
-    `trailing stop: ${autoState.trailingEnabled ? "🟢 ON" : "🔴 OFF"}`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ auto menu", "auto_menu")],
-    ])
-  );
+  return ctx.editMessageText(`trailing stop: ${autoState.trailingEnabled ? "🟢 ON" : "🔴 OFF"}`, Markup.inlineKeyboard([[Markup.button.callback("⬅️ auto menu", "auto_menu")]]));
 });
 
 bot.action("auto_set_tp", (ctx) => {
   SESSIONS[ctx.chat.id] = { step: "set_tp" };
-  return ctx.editMessageText("kirim angka TP (contoh: 40 buat +40%):", Markup.inlineKeyboard([
-    [Markup.button.callback("❌ cancel", "auto_menu")],
-  ]));
+  return ctx.editMessageText("kirim angka TP (contoh: 40 buat +40%):", Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "auto_menu")]]));
 });
 bot.action("auto_set_sl", (ctx) => {
   SESSIONS[ctx.chat.id] = { step: "set_sl" };
-  return ctx.editMessageText("kirim angka SL (contoh: -15 buat -15%):", Markup.inlineKeyboard([
-    [Markup.button.callback("❌ cancel", "auto_menu")],
-  ]));
+  return ctx.editMessageText("kirim angka SL (contoh: -15 buat -15%):", Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "auto_menu")]]));
 });
 bot.action("trail_set", (ctx) => {
   SESSIONS[ctx.chat.id] = { step: "set_trail" };
-  return ctx.editMessageText("kirim trailing % (contoh: 10 buat jual kalau turun 10% dari peak):", Markup.inlineKeyboard([
-    [Markup.button.callback("❌ cancel", "auto_menu")],
-  ]));
+  return ctx.editMessageText("kirim trailing % (contoh: 10 buat jual kalau turun 10% dari peak):", Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "auto_menu")]]));
 });
 
 // --- launch flow ---
 bot.action("launch", (ctx) => {
   SESSIONS[ctx.chat.id] = { step: "name", data: {} };
   return ctx.editMessageText("🚀 *LAUNCH TOKEN*\n\nmasukkan nama token:", {
-    parse_mode: "Markdown",
-    ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]),
+    parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]),
   });
 });
 
@@ -503,31 +493,15 @@ bot.on("text", async (ctx, next) => {
   if (!s) return next();
   const text = ctx.message.text.trim();
 
-  if (s.step === "set_tp") {
-    autoState.tp = parseFloat(text);
-    delete SESSIONS[ctx.chat.id];
-    return ctx.reply(`TP diset ke +${autoState.tp}%`, Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ auto menu", "auto_menu")],
-    ]));
-  }
-  if (s.step === "set_sl") {
-    autoState.sl = parseFloat(text);
-    delete SESSIONS[ctx.chat.id];
-    return ctx.reply(`SL diset ke ${autoState.sl}%`, Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ auto menu", "auto_menu")],
-    ]));
-  }
-  if (s.step === "set_trail") {
-    autoState.trailingPercent = parseFloat(text);
-    delete SESSIONS[ctx.chat.id];
-    return ctx.reply(`trailing diset ke ${autoState.trailingPercent}%`, Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ auto menu", "auto_menu")],
-    ]));
-  }
+  if (s.step === "set_tp") { autoState.tp = parseFloat(text); delete SESSIONS[ctx.chat.id]; return ctx.reply(`TP diset ke +${autoState.tp}%`, Markup.inlineKeyboard([[Markup.button.callback("⬅️ auto menu", "auto_menu")]])); }
+  if (s.step === "set_sl") { autoState.sl = parseFloat(text); delete SESSIONS[ctx.chat.id]; return ctx.reply(`SL diset ke ${autoState.sl}%`, Markup.inlineKeyboard([[Markup.button.callback("⬅️ auto menu", "auto_menu")]])); }
+  if (s.step === "set_trail") { autoState.trailingPercent = parseFloat(text); delete SESSIONS[ctx.chat.id]; return ctx.reply(`trailing diset ke ${autoState.trailingPercent}%`, Markup.inlineKeyboard([[Markup.button.callback("⬅️ auto menu", "auto_menu")]])); }
+
   if (s.step === "name") { s.data.name = text; s.step = "symbol"; return ctx.reply("simbol token:"); }
   if (s.step === "symbol") { s.data.symbol = text.toUpperCase(); s.step = "description"; return ctx.reply("deskripsi:"); }
   if (s.step === "description") { s.data.description = text; s.step = "image"; return ctx.reply("URL image (atau '-' skip):"); }
   if (s.step === "image") { s.data.imageUrl = text === "-" ? "" : text; s.step = "devbuy"; return ctx.reply("dev buy berapa SOL? (contoh 0.05, atau '-' skip):"); }
+  
   if (s.step === "devbuy") {
     const devBuyAmt = text === "-" ? 0 : parseFloat(text);
     delete SESSIONS[ctx.chat.id];
@@ -536,41 +510,24 @@ bot.on("text", async (ctx, next) => {
       const res = await launchToken({ ...s.data, devBuyAmt });
       LAUNCHED[res.mint] = { ...res, ...s.data };
       await ctx.reply(
-        `✅ *LAUNCHED*\nmint: \`${res.mint}\`\nsymbol: ${s.data.symbol}\ntx: \`${res.signature}\`` +
-        (res.devBuySig ? `\ndev buy tx: \`${res.devBuySig}\`` : ""),
-        { parse_mode: "Markdown", ...Markup.inlineKeyboard([
-          [Markup.button.callback("🔴 DUMP TOKEN INI", `dump_${res.mint}`)],
-          [Markup.button.callback("⬅️ menu", "menu")],
-        ]) }
+        `✅ *LAUNCHED*\nmint: \`${res.mint}\`\nsymbol: ${s.data.symbol}\ntx: \`${res.signature}\`` + (res.devBuySig ? `\ndev buy tx: \`${res.devBuySig}\`` : ""),
+        { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("🔴 DUMP TOKEN INI", `dump_${res.mint}`)], [Markup.button.callback("⬅️ menu", "menu")]]) }
       );
     } catch (e) {
-      await ctx.reply(`❌ launch gagal: ${e.message}`, Markup.inlineKeyboard([
-        [Markup.button.callback("⬅️ menu", "menu")],
-      ]));
+      await ctx.reply(`❌ launch gagal: ${e.message}`, Markup.inlineKeyboard([[Markup.button.callback("⬅️ menu", "menu")]]));
     }
   }
-  if (s.step === "withdraw_addr") {
-    s.data.dest = text; s.step = "withdraw_amt";
-    return ctx.reply("jumlah SOL yang mau ditarik:");
-  }
+  
+  if (s.step === "withdraw_addr") { s.data.dest = text; s.step = "withdraw_amt"; return ctx.reply("jumlah SOL yang mau ditarik:"); }
   if (s.step === "withdraw_amt") {
     const amt = parseFloat(text);
     delete SESSIONS[ctx.chat.id];
     try {
-      const ix = SystemProgram.transfer({
-        fromPubkey: wallet.publicKey,
-        toPubkey: new PublicKey(s.data.dest),
-        lamports: Math.floor(amt * LAMPORTS_PER_SOL),
-      });
+      const ix = SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: new PublicKey(s.data.dest), lamports: Math.floor(amt * LAMPORTS_PER_SOL) });
       const sig = await sendIx([ix]);
-      return ctx.reply(`✅ withdraw ${amt} SOL\ntx: \`${sig}\``, {
-        parse_mode: "Markdown",
-        ...Markup.inlineKeyboard([[Markup.button.callback("⬅️ menu", "menu")]]),
-      });
+      return ctx.reply(`✅ withdraw ${amt} SOL\ntx: \`${sig}\``, { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("⬅️ menu", "menu")]]) });
     } catch (e) {
-      return ctx.reply(`❌ withdraw gagal: ${e.message}`, Markup.inlineKeyboard([
-        [Markup.button.callback("⬅️ menu", "menu")],
-      ]));
+      return ctx.reply(`❌ withdraw gagal: ${e.message}`, Markup.inlineKeyboard([[Markup.button.callback("⬅️ menu", "menu")]]));
     }
   }
 });
@@ -578,14 +535,8 @@ bot.on("text", async (ctx, next) => {
 // --- dump list ---
 bot.action("dump_list", (ctx) => {
   const launched = Object.entries(LAUNCHED);
-  if (!launched.length) {
-    return ctx.editMessageText("belum ada token yang lo launch.", Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ menu", "menu")],
-    ]));
-  }
-  const buttons = launched.map(([mint, info]) => [
-    Markup.button.callback(`🔴 DUMP ${info.symbol} (${mint.slice(0, 6)})`, `dump_${mint}`),
-  ]);
+  if (!launched.length) return ctx.editMessageText("belum ada token yang lo launch.", Markup.inlineKeyboard([[Markup.button.callback("⬅️ menu", "menu")]]));
+  const buttons = launched.map(([mint, info]) => [Markup.button.callback(`🔴 DUMP ${info.symbol} (${mint.slice(0, 6)})`, `dump_${mint}`)]);
   buttons.push([Markup.button.callback("⬅️ menu", "menu")]);
   return ctx.editMessageText("pilih token buat dump 100%:", Markup.inlineKeyboard(buttons));
 });
@@ -597,39 +548,21 @@ bot.action(/^dump_(.+)$/, async (ctx) => {
     const sig = await sellAll(mint);
     delete POSITIONS[mint];
     savePositions();
-    await ctx.editMessageText(`🔴 *DUMPED* ${mint.slice(0, 8)}\ntx: \`${sig}\``, {
-      parse_mode: "Markdown",
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback("🔴 DUMP LIST", "dump_list")],
-        [Markup.button.callback("⬅️ menu", "menu")],
-      ]),
-    });
+    await ctx.editMessageText(`🔴 *DUMPED* ${mint.slice(0, 8)}\ntx: \`${sig}\``, { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("🔴 DUMP LIST", "dump_list")], [Markup.button.callback("⬅️ menu", "menu")]]) });
   } catch (e) {
-    await ctx.editMessageText(`❌ gagal dump: ${e.message}`, Markup.inlineKeyboard([
-      [Markup.button.callback("🔴 DUMP LIST", "dump_list")],
-      [Markup.button.callback("⬅️ menu", "menu")],
-    ]));
+    await ctx.editMessageText(`❌ gagal dump: ${e.message}`, Markup.inlineKeyboard([[Markup.button.callback("🔴 DUMP LIST", "dump_list")], [Markup.button.callback("⬅️ menu", "menu")]]));
   }
 });
 
 // --- wallet / withdraw ---
 bot.action("wallet", async (ctx) => {
   const bal = await getBalance();
-  await ctx.editMessageText(
-    `📊 *WALLET*\nSOL: *${bal.toFixed(4)}*\naddr: \`${wallet.publicKey.toBase58()}\``,
-    { parse_mode: "Markdown", ...Markup.inlineKeyboard([
-      [Markup.button.callback("💰 WITHDRAW", "withdraw")],
-      [Markup.button.callback("⬅️ menu", "menu")],
-    ]) }
-  );
+  await ctx.editMessageText(`📊 *WALLET*\nSOL: *${bal.toFixed(4)}*\naddr: \`${wallet.publicKey.toBase58()}\``, { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("💰 WITHDRAW", "withdraw")], [Markup.button.callback("⬅️ menu", "menu")]]) });
 });
 
 bot.action("withdraw", (ctx) => {
   SESSIONS[ctx.chat.id] = { step: "withdraw_addr", data: {} };
-  return ctx.editMessageText("💰 *WITHDRAW*\n\nkirim alamat tujuan:", {
-    parse_mode: "Markdown",
-    ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]),
-  });
+  return ctx.editMessageText("💰 *WITHDRAW*\n\nkirim alamat tujuan:", { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]) });
 });
 
 // --- auto monitor sniper ---
@@ -637,9 +570,7 @@ connection.onLogs(
   new PublicKey(PUMP_PROGRAM_ID),
   async ({ logs, signature }) => {
     if (!logs.some((l) => l.includes("Instruction: Create"))) return;
-    const tx = await connection.getTransaction(signature, {
-      maxSupportedTransactionVersion: 0, commitment: "confirmed",
-    });
+    const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
     if (!tx) return;
     const mint = (tx.meta.postTokenBalances || [])[0]?.mint;
     if (!mint) return;
@@ -648,21 +579,13 @@ connection.onLogs(
       const res = await analyze({ mint, devWallet: dev });
       TOKENS[mint] = res;
       if (res.score >= SCORE_THRESHOLD && CHAT_ID) {
-        await bot.telegram.sendMessage(
-          CHAT_ID,
-          `🎯 *NEW SNIPE CANDIDATE*\n\`${mint}\`\nskor: ${res.score}`,
-          { parse_mode: "Markdown", ...Markup.inlineKeyboard([
-            [Markup.button.callback("🎯 SNIPE", "list_snipe")],
-          ]) }
-        );
+        await bot.telegram.sendMessage(CHAT_ID, `🎯 *NEW SNIPE CANDIDATE*\n\`${mint}\`\nskor: ${res.score}`, { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("🎯 SNIPE", "list_snipe")]]) });
       }
     } catch (e) { console.error(e.message); }
   },
   "confirmed"
 );
 
-// start auto-sell loop
 autoSellLoop();
-
 bot.launch();
 console.log("🚀 bot running — sniper + launcher + rugpull + PnL + TP/SL + trailing");

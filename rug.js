@@ -48,7 +48,7 @@ async function getDevBuy(devWallet) {
   for (const s of sigs) {
     if (s.err) continue;
     const tx = await rpc("getTransaction", [
-      s.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+      s.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 },
     ]);
     try {
       const d = Math.abs(tx.meta.preBalances[0] - tx.meta.postBalances[0]) / 1e9;
@@ -563,7 +563,7 @@ bot.action("withdraw", (ctx) => {
   return ctx.editMessageText("💰 *WITHDRAW*\n\nkirim alamat tujuan:", { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]) });
 });
 
-// --- auto monitor sniper (DENGAN PENGAMAN ANTI CRASH) ---
+// --- auto monitor sniper (VERSI FIX: maxSupportedTransactionVersion 1) ---
 connection.onLogs(
   new PublicKey(PUMP_PROGRAM_ID),
   async ({ logs, signature }) => {
@@ -571,7 +571,7 @@ connection.onLogs(
       if (!logs.some((l) => l.includes("Instruction: Create"))) return;
       
       const tx = await connection.getTransaction(signature, { 
-        maxSupportedTransactionVersion: 0, 
+        maxSupportedTransactionVersion: 1, // <--- UDAH DIGANTI JADI 1
         commitment: "confirmed" 
       });
       

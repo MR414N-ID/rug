@@ -22,15 +22,14 @@ const PRIVATE_KEY     = process.env.WALLET_PRIVATE_KEY;
 const BUY_AMOUNT_SOL  = parseFloat(process.env.BUY_AMOUNT_SOL || "0.0066"); // ~$1
 const SCORE_THRESHOLD = parseInt(process.env.SCORE_THRESHOLD || "70");
 const CHAT_ID         = process.env.CHAT_ID || "";
+const PINATA_JWT      = process.env.PINATA_JWT || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
-const CHECK_INTERVAL_MS = 5000;
+const CHECK_INTERVAL_MS = 15000; // Diperlambat jadi 15 detik biar hemat RPC
 
-// ============ RPC HELPERS (DENGAN ANTI-LIMIT) ============
+// ============ RPC HELPERS ============
 async function rpc(method, params) {
-  // Jeda 1.5 detik biar RPC gratis nggak kewalahan
-  await new Promise((r) => setTimeout(r, 1500)); 
-  
+  await new Promise((r) => setTimeout(r, 2000)); // Jeda 2 detik anti-limit 429
   const res = await fetch(RPC_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -96,6 +95,25 @@ async function analyze({ mint, devWallet, metadataUri = "", mcap = 0 }) {
     verdict: total >= 70 ? "SNIPE" : total >= 50 ? "WATCH" : "SKIP",
     breakdown: scores,
   };
+}
+
+// ============ IPFS UPLOAD (PINATA) ============
+async function uploadToPinata(data) {
+  if (!PINATA_JWT) throw new Error("PINATA_JWT belum diisi di .env");
+  const res = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${PINATA_JWT}`
+    },
+    body: JSON.stringify({
+      pinataContent: data,
+      pinataMetadata: { name: `${data.name || data.symbol}_metadata.json` }
+    })
+  });
+  const json = await res.json();
+  if (!json.IpfsHash) throw new Error("Gagal upload ke IPFS (cek JWT Pinata)");
+  return `https://gateway.pinata.cloud/ipfs/${json.IpfsHash}`;
 }
 
 // ============ TRADER ============
@@ -171,12 +189,17 @@ async function getTokenHoldings() {
   return holdings;
 }
 
-// ============ LAUNCHER (Fitur Launch Token) ============
+// ============ LAUNCHER (DENGAN IPFS AUTO-UPLOAD) ============
 async function launchToken({ name, symbol, description, imageUrl, devBuyAmt }) {
   const mintKeypair = Keypair.generate();
   const mint = mintKeypair.publicKey;
-  const metadataUri = process.env.METADATA_BASE_URI
-    ? `${process.env.METADATA_BASE_URI}/${mint.toBase58()}.json` : "https://example.com/meta.json"; // Fallback
+
+  // Upload metadata ke IPFS Pinata
+  const metadataJson = {
+    name, symbol, description, image: imageUrl, 
+    twitter: "", telegram: "", website: ""
+  };
+  const metadataUri = await uploadToPinata(metadataJson);
 
   await getOrCreateAssociatedTokenAccount(connection, wallet, mint, wallet.publicKey, true, undefined, undefined, TOKEN_PROGRAM_ID);
 
@@ -500,13 +523,13 @@ bot.on("text", async (ctx, next) => {
 
   if (s.step === "name") { s.data.name = text; s.step = "symbol"; return ctx.reply("simbol token:"); }
   if (s.step === "symbol") { s.data.symbol = text.toUpperCase(); s.step = "description"; return ctx.reply("deskripsi:"); }
-  if (s.step === "description") { s.data.description = text; s.step = "image"; return ctx.reply("URL image (atau '-' skip):"); }
-  if (s.step === "image") { s.data.imageUrl = text === "-" ? "" : text; s.step = "devbuy"; return ctx.reply("dev buy berapa SOL? (contoh 0.05, atau '-' skip):"); }
+  if (s.step === "description") { s.data.description = text; s.step = "image"; return ctx.reply("URL image (contoh: https://i.imgur.com/xxx.png):"); }
+  if (s.step === "image") { s.data.imageUrl = text; s.step = "devbuy"; return ctx.reply("dev buy berapa SOL? (contoh 0.05, atau '-' skip):"); }
   
   if (s.step === "devbuy") {
     const devBuyAmt = text === "-" ? 0 : parseFloat(text);
     delete SESSIONS[ctx.chat.id];
-    await ctx.reply("⏳ launch...");
+    await ctx.reply("⏳ Upload ke IPFS & Launch token...");
     try {
       const res = await launchToken({ ...s.data, devBuyAmt });
       LAUNCHED[res.mint] = { ...res, ...s.data };
@@ -566,15 +589,14 @@ bot.action("withdraw", (ctx) => {
   return ctx.editMessageText("💰 *WITHDRAW*\n\nkirim alamat tujuan:", { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]) });
 });
 
-// --- auto monitor sniper (VERSI ANTI LIMIT 429) ---
+// --- auto monitor sniper ---
 connection.onLogs(
   new PublicKey(PUMP_PROGRAM_ID),
   async ({ logs, signature }) => {
     try {
       if (!logs.some((l) => l.includes("Instruction: Create"))) return;
       
-      // Jeda 1.5 detik biar RPC gratis nggak ngamuk
-      await new Promise((r) => setTimeout(r, 1500)); 
+      await new Promise((r) => setTimeout(r, 2000)); 
       
       const tx = await connection.getTransaction(signature, { 
         maxSupportedTransactionVersion: 1,
@@ -600,7 +622,6 @@ connection.onLogs(
         );
       }
     } catch (e) {
-      // Kalau tetep kena limit, print warning tapi jangan matiin bot
       if (e.message.includes("429")) {
          console.error("Kena limit RPC (429), istirahat sebentar...");
       } else {

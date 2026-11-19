@@ -26,8 +26,11 @@ const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 const CHECK_INTERVAL_MS = 5000;
 
-// ============ RPC HELPERS ============
+// ============ RPC HELPERS (DENGAN ANTI-LIMIT) ============
 async function rpc(method, params) {
+  // Jeda 1.5 detik biar RPC gratis nggak kewalahan
+  await new Promise((r) => setTimeout(r, 1500)); 
+  
   const res = await fetch(RPC_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -563,15 +566,18 @@ bot.action("withdraw", (ctx) => {
   return ctx.editMessageText("💰 *WITHDRAW*\n\nkirim alamat tujuan:", { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("❌ cancel", "menu")]]) });
 });
 
-// --- auto monitor sniper (VERSI FIX: maxSupportedTransactionVersion 1) ---
+// --- auto monitor sniper (VERSI ANTI LIMIT 429) ---
 connection.onLogs(
   new PublicKey(PUMP_PROGRAM_ID),
   async ({ logs, signature }) => {
     try {
       if (!logs.some((l) => l.includes("Instruction: Create"))) return;
       
+      // Jeda 1.5 detik biar RPC gratis nggak ngamuk
+      await new Promise((r) => setTimeout(r, 1500)); 
+      
       const tx = await connection.getTransaction(signature, { 
-        maxSupportedTransactionVersion: 1, // <--- UDAH DIGANTI JADI 1
+        maxSupportedTransactionVersion: 1,
         commitment: "confirmed" 
       });
       
@@ -594,7 +600,12 @@ connection.onLogs(
         );
       }
     } catch (e) {
-      console.error("Monitor skip error:", e.message);
+      // Kalau tetep kena limit, print warning tapi jangan matiin bot
+      if (e.message.includes("429")) {
+         console.error("Kena limit RPC (429), istirahat sebentar...");
+      } else {
+         console.error("Monitor skip error:", e.message);
+      }
     }
   },
   "confirmed"

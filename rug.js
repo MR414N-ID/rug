@@ -4,12 +4,13 @@ dotenv.config();
 import {
   Connection, Keypair, PublicKey, VersionedTransaction,
   TransactionMessage, SystemProgram, LAMPORTS_PER_SOL,
-  ComputeBudgetProgram,
+  ComputeBudgetProgram, TransactionInstruction,
 } from "@solana/web3.js";
 import {
   getAssociatedTokenAddress, TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountIdempotentInstruction,
 } from "@solana/spl-token";
-import { PumpSdk } from "@pump-fun/pump-sdk";
 import { Telegraf, Markup } from "telegraf";
 import bs58 from "bs58";
 import fetch from "node-fetch";
@@ -27,10 +28,11 @@ const POSITIONS_FILE  = "./positions.json";
 const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "50");
 const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");
 const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");
-const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.06");
-const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.10");
+const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.08");
+const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.12");
 const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "8000");
 const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "8");
+const MAX_LIQ_SOL       = parseFloat(process.env.MAX_LIQ_SOL || "500");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
 const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
 const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "800");
@@ -40,7 +42,7 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
-// ============ CURRENCY (SOL/USD/IDR) ============
+// ============ CURRENCY ============
 const priceCache = { solUsd: 140, usdIdr: 16000, lastUpdate: 0 };
 async function updatePrices() {
   try {
@@ -55,7 +57,6 @@ async function updatePrices() {
 }
 function solToIdr(sol) { return Math.round(sol * priceCache.solUsd * priceCache.usdIdr); }
 function fmtIdr(sol) { return `Rp ${solToIdr(sol).toLocaleString('id-ID')}`; }
-function fmtSol(sol) { return `${sol.toFixed(4)} SOL (~${fmtIdr(sol)})`; }
 function fmtPnl(sol) {
   const sign = sol >= 0 ? "+" : "-";
   return `${sign}${Math.abs(sol).toFixed(4)} SOL (~${sign}${fmtIdr(Math.abs(sol))})`;
@@ -97,8 +98,9 @@ async function getLargestHolders(mint) {
 // ============ TRADER ============
 const connection = new Connection(RPC_URL, "confirmed");
 const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-const sdk = new PumpSdk(connection);
 const PUMP_PROGRAM = new PublicKey(PUMP_PROGRAM_ID);
+const SYS_PROGRAM = SystemProgram.programId;
+const RENT_SYSVAR = new PublicKey("SysvarRent111111111111111111111111111111111");
 
 async function getRawBalance() {
   return (await connection.getBalance(wallet.publicKey)) / 1e9;
@@ -109,11 +111,26 @@ async function getSafeBalance() {
   return usable > 0 ? usable : 0;
 }
 
-// ============ BONDING CURVE PDA (tanpa SDK) ============
+// ============ PDAs & BONDING CURVE ============
 function getBondingCurvePDA(mintStr) {
   const mint = new PublicKey(mintStr);
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("bonding-curve"), mint.toBuffer()],
+    PUMP_PROGRAM
+  );
+  return pda;
+}
+function getGlobalPDA() {
+  const [pda] = PublicKey.findProgramAddressSync([Buffer.from("global")], PUMP_PROGRAM);
+  return pda;
+}
+function getEventAuthorityPDA() {
+  const [pda] = PublicKey.findProgramAddressSync([Buffer.from("__event_authority")], PUMP_PROGRAM);
+  return pda;
+}
+function getCreatorVaultPDA(creator) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("creator-vault"), creator.toBuffer()],
     PUMP_PROGRAM
   );
   return pda;
@@ -127,29 +144,252 @@ async function isPumpToken(mintStr) {
   } catch { return false; }
 }
 
+async function getBondingCurveState(mintStr) {
+  const pda = getBondingCurvePDA(mintStr);
+  const info = await connection.getAccountInfo(pda);
+  if (!info || info.data.length < 81) return null;
+  return {
+    pda,
+    virtualTokenReserves: info.data.readBigUInt64LE(8),
+    virtualSolReserves:   info.data.readBigUInt64LE(16),
+    realTokenReserves:    info.data.readBigUInt64LE(24),
+    realSolReserves:      info.data.readBigUInt64LE(32),
+    tokenTotalSupply:     info.data.readBigUInt64LE(40),
+    complete:             info.data[48] === 1,
+    creator:              new PublicKey(info.data.slice(49, 81)),
+  };
+}
+
 async function getLiquidity(mint) {
   try {
-    const pda = getBondingCurvePDA(mint);
-    const info = await connection.getAccountInfo(pda);
-    if (!info || info.data.length < 24) return 0;
-    const virtualSolReserves = info.data.readBigUInt64LE(16);
-    return Number(virtualSolReserves) / 1e9;
+    const st = await getBondingCurveState(mint);
+    if (!st) return 0;
+    return Number(st.virtualSolReserves) / 1e9;
   } catch { return 0; }
 }
 
 async function getCurrentPrice(mintStr) {
   try {
-    const pda = getBondingCurvePDA(mintStr);
-    const info = await connection.getAccountInfo(pda);
-    if (!info || info.data.length < 24) return 0;
-    const virtualTokenReserves = info.data.readBigUInt64LE(8);
-    const virtualSolReserves = info.data.readBigUInt64LE(16);
-    if (virtualTokenReserves === 0n) return 0;
-    return Number(virtualSolReserves) / Number(virtualTokenReserves);
+    const st = await getBondingCurveState(mintStr);
+    if (!st || st.virtualTokenReserves === 0n) return 0;
+    return Number(st.virtualSolReserves) / Number(st.virtualTokenReserves);
   } catch { return 0; }
 }
 
-// ============ MULTI-SIGNAL ANALYZER ============
+// ============ FEE RECIPIENT (baca dari global account) ============
+let cachedFeeRecipient = null;
+async function getFeeRecipient() {
+  if (cachedFeeRecipient) return cachedFeeRecipient;
+  try {
+    const globalPDA = getGlobalPDA();
+    const info = await connection.getAccountInfo(globalPDA);
+    if (info && info.data.length >= 73) {
+      // layout: disc(8) + initialized(1) + authority(32) + fee_recipient(32)
+      cachedFeeRecipient = new PublicKey(info.data.slice(41, 73));
+      return cachedFeeRecipient;
+    }
+  } catch (e) { console.error("getFeeRecipient:", e.message); }
+  // fallback
+  cachedFeeRecipient = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
+  return cachedFeeRecipient;
+}
+
+// ============ MANUAL BUY / SELL INSTRUCTIONS ============
+const BUY_DISC  = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const SELL_DISC = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
+
+async function buildBuyIx(mintStr, solAmount) {
+  const mint = new PublicKey(mintStr);
+  const state = await getBondingCurveState(mintStr);
+  if (!state) throw new Error("bonding curve not found");
+  if (state.complete) throw new Error("token graduated");
+
+  const feeRecipient = await getFeeRecipient();
+  const creatorVault = getCreatorVaultPDA(state.creator);
+  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true);
+  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
+
+  const solLamports = BigInt(Math.floor(solAmount * 1e9));
+  // fee Pump.fun 1%
+  const solAfterFee = solLamports * 99n / 100n;
+  // constant product: tokens_out = vToken * solIn / (vSol + solIn)
+  const tokensOut = (solAfterFee * state.virtualTokenReserves) / (state.virtualSolReserves + solAfterFee);
+  const minTokensOut = tokensOut * BigInt(Math.floor((1 - SLIPPAGE_BUY) * 100)) / 100n;
+
+  if (minTokensOut <= 0n) throw new Error("min tokens zero");
+
+  const data = Buffer.alloc(24);
+  BUY_DISC.copy(data, 0);
+  data.writeBigUInt64LE(minTokensOut, 8);  // amount (min tokens)
+  data.writeBigUInt64LE(solLamports, 16);  // max_sol_cost
+
+  const ixBuy = new TransactionInstruction({
+    programId: PUMP_PROGRAM,
+    keys: [
+      { pubkey: getGlobalPDA(),          isSigner: false, isWritable: false },
+      { pubkey: feeRecipient,            isSigner: false, isWritable: true  },
+      { pubkey: mint,                    isSigner: false, isWritable: false },
+      { pubkey: state.pda,               isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve,  isSigner: false, isWritable: true  },
+      { pubkey: associatedUser,          isSigner: false, isWritable: true  },
+      { pubkey: wallet.publicKey,        isSigner: true,  isWritable: true  },
+      { pubkey: SYS_PROGRAM,             isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID,        isSigner: false, isWritable: false },
+      { pubkey: creatorVault,            isSigner: false, isWritable: true  },
+      { pubkey: getEventAuthorityPDA(),  isSigner: false, isWritable: false },
+      { pubkey: PUMP_PROGRAM,            isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+
+  // idempotent ATA creation sebelum buy (aman kalau udah ada)
+  const ixAta = createAssociatedTokenAccountIdempotentInstruction(
+    wallet.publicKey, associatedUser, wallet.publicKey, mint
+  );
+
+  return { instructions: [ixAta, ixBuy], expectedTokens: tokensOut, minTokensOut };
+}
+
+async function buildSellIx(mintStr, tokenAmount) {
+  const mint = new PublicKey(mintStr);
+  const state = await getBondingCurveState(mintStr);
+  if (!state) throw new Error("bonding curve not found");
+  if (state.complete) throw new Error("token graduated - sell on raydium");
+
+  const feeRecipient = await getFeeRecipient();
+  const creatorVault = getCreatorVaultPDA(state.creator);
+  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true);
+  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
+
+  // expected SOL out
+  const solOut = (tokenAmount * state.virtualSolReserves) / (state.virtualTokenReserves + tokenAmount);
+  const solOutAfterFee = solOut * 99n / 100n;
+  const minSolOut = solOutAfterFee * BigInt(Math.floor((1 - SLIPPAGE_SELL) * 100)) / 100n;
+
+  const data = Buffer.alloc(24);
+  SELL_DISC.copy(data, 0);
+  data.writeBigUInt64LE(tokenAmount, 8);  // amount (tokens to sell)
+  data.writeBigUInt64LE(minSolOut, 16);   // min_sol_output
+
+  return new TransactionInstruction({
+    programId: PUMP_PROGRAM,
+    keys: [
+      { pubkey: getGlobalPDA(),          isSigner: false, isWritable: false },
+      { pubkey: feeRecipient,            isSigner: false, isWritable: true  },
+      { pubkey: mint,                    isSigner: false, isWritable: false },
+      { pubkey: state.pda,               isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve,  isSigner: false, isWritable: true  },
+      { pubkey: associatedUser,          isSigner: false, isWritable: true  },
+      { pubkey: wallet.publicKey,        isSigner: true,  isWritable: true  },
+      { pubkey: SYS_PROGRAM,             isSigner: false, isWritable: false },
+      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID,        isSigner: false, isWritable: false },
+      { pubkey: creatorVault,            isSigner: false, isWritable: true  },
+      { pubkey: getEventAuthorityPDA(),  isSigner: false, isWritable: false },
+      { pubkey: PUMP_PROGRAM,            isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+// ============ SEND IX ============
+async function sendIx(instructions, extraSigners = []) {
+  const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE });
+  const allIx = [priorityIx, ...instructions];
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      const msg = new TransactionMessage({
+        payerKey: wallet.publicKey, recentBlockhash: blockhash, instructions: allIx,
+      }).compileToV0Message();
+      const tx = new VersionedTransaction(msg);
+      tx.sign([wallet, ...extraSigners]);
+      const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+      const conf = await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+      if (conf.value.err) throw new Error(`tx failed: ${JSON.stringify(conf.value.err)}`);
+      return sig;
+    } catch (e) {
+      lastErr = e;
+      console.error(`sendIx attempt ${attempt + 1} failed:`, e.message);
+      if (e.message.includes("block height exceeded") || e.message.includes("expired")) {
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+// ============ BUY / SELL ============
+async function buy(mintStr, solAmount) {
+  const { instructions } = await buildBuyIx(mintStr, solAmount);
+  return sendIx(instructions);
+}
+
+async function buyWithRetry(mintStr, solAmount) {
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await buy(mintStr, solAmount);
+    } catch (e) {
+      lastErr = e;
+      console.error(`buy attempt ${i+1}: ${e.message}`);
+      if (e.message.includes("bonding curve not found") || e.message.includes("account not found")) {
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      if (e.message.includes("custom program error") || e.message.includes("account")) {
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
+async function sellAll(mintStr) {
+  const mint = new PublicKey(mintStr);
+  const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+  let info;
+  try {
+    info = await connection.getTokenAccountBalance(ata);
+  } catch (e) {
+    throw new Error(`no ATA: ${e.message}`);
+  }
+  const raw = BigInt(info.value.amount);
+  if (raw === 0n) throw new Error("no token balance");
+  const ix = await buildSellIx(mintStr, raw);
+  return sendIx([ix]);
+}
+
+async function sellAllWithRetry(mintStr) {
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await sellAll(mintStr);
+    } catch (e) {
+      lastErr = e;
+      console.error(`sell attempt ${i+1}: ${e.message}`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  throw lastErr;
+}
+
+async function getTokenHoldings() {
+  const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { programId: TOKEN_PROGRAM_ID });
+  const holdings = [];
+  for (const acc of accounts.value) {
+    const info = acc.account.data.parsed.info;
+    if (info.tokenAmount.uiAmount > 0) holdings.push({ mint: info.mint, amount: info.tokenAmount.uiAmount });
+  }
+  return holdings;
+}
+
+// ============ ANALYZER ============
 async function getHolderConcentration(mint, supply) {
   const holders = await getLargestHolders(mint);
   if (!holders.length || supply <= 0) return { top10: 100, top20: 100, count: 0 };
@@ -181,7 +421,6 @@ async function getMintAuthority(mint) {
     return info.value?.data?.parsed?.info?.mintAuthority || null;
   } catch { return null; }
 }
-
 async function getFreezeAuthority(mint) {
   try {
     const info = await connection.getParsedAccountInfo(new PublicKey(mint));
@@ -192,15 +431,19 @@ async function getFreezeAuthority(mint) {
 async function analyze({ mint }) {
   try {
     const supply = await getTokenSupply(mint);
-    const [concentration, liqSol, volume, mintAuth, freezeAuth] = await Promise.all([
+    const [concentration, liqSol, volume, mintAuth, freezeAuth, state] = await Promise.all([
       getHolderConcentration(mint, supply),
       getLiquidity(mint),
       getVolumeData(mint),
       getMintAuthority(mint),
       getFreezeAuthority(mint),
+      getBondingCurveState(mint),
     ]);
 
+    if (!state) return { score: 0, reason: `no bonding curve` };
+    if (state.complete) return { score: 0, reason: `graduated` };
     if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq ${liqSol.toFixed(1)} < ${MIN_LIQ_SOL}` };
+    if (liqSol > MAX_LIQ_SOL) return { score: 0, reason: `graduated (liq ${liqSol.toFixed(0)} > ${MAX_LIQ_SOL})` };
     if (freezeAuth) return { score: 0, reason: `freeze authority aktif` };
     if (concentration.top10 > 90) return { score: 0, reason: `top10 ${concentration.top10}% > 90%` };
 
@@ -220,7 +463,6 @@ async function analyze({ mint }) {
     if (volume.vol5m > 2000) volScore = 100;
     else if (volume.vol5m > 500) volScore = 80;
     else if (volume.vol5m > 100) volScore = 50;
-    else volScore = 0;
 
     let momentumScore = 0;
     if (volume.buys5m + volume.sells5m > 0) {
@@ -228,7 +470,6 @@ async function analyze({ mint }) {
       if (buyRatio > 0.65) momentumScore = 100;
       else if (buyRatio > 0.55) momentumScore = 70;
       else if (buyRatio > 0.45) momentumScore = 40;
-      else momentumScore = 0;
     }
     if (volume.priceChange5m > 5 && volume.priceChange5m < 50) momentumScore = Math.min(100, momentumScore + 20);
     else if (volume.priceChange5m >= 100) momentumScore = Math.max(0, momentumScore - 30);
@@ -257,90 +498,6 @@ async function analyze({ mint }) {
   }
 }
 
-// ============ SEND IX ============
-async function sendIx(instructions, extraSigners = []) {
-  const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE });
-  const allIx = [priorityIx, ...instructions];
-  let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-      const msg = new TransactionMessage({
-        payerKey: wallet.publicKey, recentBlockhash: blockhash, instructions: allIx,
-      }).compileToV0Message();
-      const tx = new VersionedTransaction(msg);
-      tx.sign([wallet, ...extraSigners]);
-      const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-      const conf = await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-      if (conf.value.err) throw new Error(`tx failed: ${JSON.stringify(conf.value.err)}`);
-      return sig;
-    } catch (e) {
-      lastErr = e;
-      console.error(`sendIx attempt ${attempt + 1} failed:`, e.message);
-      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-    }
-  }
-  throw lastErr;
-}
-
-// ============ BUY / SELL ============
-async function buy(mintStr, solAmount) {
-  const mint = new PublicKey(mintStr);
-  const lamports = Math.floor(solAmount * 1e9);
-  const state = await sdk.fetchBuyState(mint, wallet.publicKey);
-  const price = parseFloat(state.bondingCurve.virtualSolReserves.toString()) /
-                parseFloat(state.bondingCurve.virtualTokenReserves.toString());
-  const expectedTokens = (solAmount / price);
-  const minTokens = Math.floor(expectedTokens * (1 - SLIPPAGE_BUY));
-  const ix = await sdk.buyInstructions({
-    bondingCurveAccountInfo: state.bondingCurveAccountInfo, bondingCurve: state.bondingCurve,
-    associatedUserAccountInfo: state.associatedUserAccountInfo, mint, user: wallet.publicKey,
-    solAmount: BigInt(lamports), amount: BigInt(minTokens), slippage: SLIPPAGE_BUY,
-  });
-  return sendIx(ix);
-}
-
-async function buyWithRetry(mintStr, solAmount) {
-  for (let i = 0; i < 3; i++) {
-    try {
-      return await buy(mintStr, solAmount);
-    } catch (e) {
-      console.error(`buy attempt ${i+1} failed: ${e.message}`);
-      if (e.message.includes("could not find") || e.message.includes("does not exist") || e.message.includes("Account not found")) {
-        await new Promise(r => setTimeout(r, 2000));
-        continue;
-      }
-      throw e;
-    }
-  }
-  throw new Error("buy failed after 3 attempts");
-}
-
-async function sellAll(mintStr) {
-  const mint = new PublicKey(mintStr);
-  const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
-  const info = await connection.getTokenAccountBalance(ata);
-  const raw = BigInt(info.value.amount);
-  if (raw === 0n) throw new Error("no token balance");
-  const state = await sdk.fetchSellState(mint, wallet.publicKey);
-  const ix = await sdk.sellInstructions({
-    bondingCurveAccountInfo: state.bondingCurveAccountInfo, bondingCurve: state.bondingCurve,
-    associatedUserAccountInfo: state.associatedUserAccountInfo, mint, user: wallet.publicKey,
-    amount: raw, slippage: SLIPPAGE_SELL,
-  });
-  return sendIx(ix);
-}
-
-async function getTokenHoldings() {
-  const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { programId: TOKEN_PROGRAM_ID });
-  const holdings = [];
-  for (const acc of accounts.value) {
-    const info = acc.account.data.parsed.info;
-    if (info.tokenAmount.uiAmount > 0) holdings.push({ mint: info.mint, amount: info.tokenAmount.uiAmount });
-  }
-  return holdings;
-}
-
 // ============ STATE ============
 let POSITIONS = {};
 if (fs.existsSync(POSITIONS_FILE)) { try { POSITIONS = JSON.parse(fs.readFileSync(POSITIONS_FILE, "utf8")); } catch {} }
@@ -365,16 +522,28 @@ async function hardModeLoop() {
         if (!pnl) continue;
         const pos = POSITIONS[mint];
         if (!pos.peakPnlPct || pnl.pnlPct > pos.peakPnlPct) { pos.peakPnlPct = pnl.pnlPct; savePositions(); }
+
+        // cek kalau token udah graduated - jual paksa
+        const state = await getBondingCurveState(mint);
+        if (state?.complete) {
+          console.log(`[${mint.slice(0,8)}] graduated, forced sell attempt`);
+          try { await sellAllWithRetry(mint); } catch (e) { console.error("forced sell failed:", e.message); }
+          delete POSITIONS[mint]; savePositions();
+          continue;
+        }
+
         let reason = null, trail = 0;
         if (pos.peakPnlPct >= 100) trail = 25;
         else if (pos.peakPnlPct >= 80) trail = 20;
         else if (pos.peakPnlPct >= 60) trail = 15;
         else if (pos.peakPnlPct >= 40) trail = 10;
         else if (pos.peakPnlPct >= 20) trail = 5;
+
         if (pnl.pnlPct <= -15) reason = "CUT LOSS";
         else if (trail > 0 && pnl.pnlPct <= (pos.peakPnlPct - trail)) reason = "TRAILING";
+
         if (reason) {
-          const sig = await sellAll(mint);
+          const sig = await sellAllWithRetry(mint);
           delete POSITIONS[mint]; savePositions();
           if (CHAT_ID) {
             const emoji = pnl.pnlSol >= 0 ? "🟢" : "🔴";
@@ -400,6 +569,8 @@ async function getPnl(mint) {
 
 // ============ AUTO MONITOR ============
 const seenSignatures = new Set();
+const processedMints = new Map();
+const MINT_COOLDOWN = 5 * 60 * 1000;
 let lastAnalyzeTime = 0;
 
 connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) => {
@@ -445,19 +616,16 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
 
     if (!candidates.length) return;
 
-    // FIX: deteksi via PDA, tanpa SDK
     let mint = null;
     for (const c of candidates) {
-      if (await isPumpToken(c)) { mint = c; break; }
+      const last = processedMints.get(c) || 0;
+      if (now - last < MINT_COOLDOWN) continue;
+      if (await isPumpToken(c)) { mint = c; processedMints.set(c, now); break; }
     }
-    if (!mint) {
-      console.log(`skip ${signature.slice(0, 8)}: no bonding curve (${candidates.length} kandidat)`);
-      return;
-    }
+    if (!mint) return;
 
     const res = await analyze({ mint });
-    const potIdr = fmtIdr(buyAmount);
-    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason} | pot beli ${buyAmount.toFixed(4)} SOL (${potIdr})`);
+    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason} | pot beli ${buyAmount.toFixed(4)} SOL (${fmtIdr(buyAmount)})`);
 
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await buyWithRetry(mint, buyAmount);
@@ -466,7 +634,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
       savePositions();
       if (CHAT_ID) await bot.telegram.sendMessage(CHAT_ID,
         `🔥 *BUY* \`${mint.slice(0, 8)}\`\n` +
-        `Amount: *${buyAmount.toFixed(4)} SOL (~${potIdr})*\n` +
+        `Amount: *${buyAmount.toFixed(4)} SOL (~${fmtIdr(buyAmount)})*\n` +
         `Skor: ${res.score}\n` +
         `${res.reason}\n` +
         `tx: \`${sig}\``,
@@ -507,10 +675,10 @@ bot.start(ctx => ctx.replyWithPhoto(WELCOME_IMG, { caption: welcomeText(), parse
   .catch(() => ctx.reply(welcomeText(), { parse_mode: "Markdown", ...menu() }).catch(() => {})));
 bot.action("menu", ctx => safeEdit(ctx, welcomeText(), menu()));
 
-bot.action("hard_menu", async ctx => {
+async function hardMenuText() {
   const status = hardMode.active ? "🟢 ON" : "🔴 OFF";
   const bal = await getRawBalance();
-  const text =
+  return (
     `🔥 *HARD MODE (COMPOUNDING)* 🔥\n\n` +
     `Status: ${status}\n` +
     `Max Koin: ${currentMaxCoins()}\n` +
@@ -518,7 +686,12 @@ bot.action("hard_menu", async ctx => {
     `Slippage: ${(SLIPPAGE_BUY*100).toFixed(0)}%/${(SLIPPAGE_SELL*100).toFixed(0)}%\n` +
     `Circuit: -50%\n\n` +
     `Saldo: *${bal.toFixed(4)} SOL*\n` +
-    `(~${fmtIdr(bal)})`;
+    `(~${fmtIdr(bal)})`
+  );
+}
+
+bot.action("hard_menu", async ctx => {
+  const text = await hardMenuText();
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback(hardMode.active ? "🔴 STOP HARD MODE" : "🟢 START HARD MODE", "hard_toggle")],
     [Markup.button.callback("💼 SELL ALL NOW", "hard_sellall")],
@@ -531,7 +704,7 @@ bot.action("hard_toggle", async ctx => {
   try {
     if (!hardMode.active) {
       const bal = await getSafeBalance();
-      if (bal < 0.01) return ctx.answerCbQuery("❌ Saldo aman < 0.01 SOL. Isi dulu wallet bot!", { show_alert: true });
+      if (bal < 0.01) return ctx.answerCbQuery("❌ Saldo aman < 0.01 SOL!", { show_alert: true });
       hardMode.initialBalance = bal;
       hardMode.active = true;
       await ctx.answerCbQuery("Hard Mode ON!");
@@ -550,17 +723,7 @@ bot.action("hard_toggle", async ctx => {
         } catch (e) { await ctx.reply(`❌ Withdraw gagal: ${e.message}`); }
       }
     }
-    const status = hardMode.active ? "🟢 ON" : "🔴 OFF";
-    const bal = await getRawBalance();
-    const text =
-      `🔥 *HARD MODE (COMPOUNDING)* 🔥\n\n` +
-      `Status: ${status}\n` +
-      `Max Koin: ${currentMaxCoins()}\n` +
-      `Score Min: ${SCORE_THRESHOLD}\n` +
-      `Slippage: ${(SLIPPAGE_BUY*100).toFixed(0)}%/${(SLIPPAGE_SELL*100).toFixed(0)}%\n` +
-      `Circuit: -50%\n\n` +
-      `Saldo: *${bal.toFixed(4)} SOL*\n` +
-      `(~${fmtIdr(bal)})`;
+    const text = await hardMenuText();
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback(hardMode.active ? "🔴 STOP HARD MODE" : "🟢 START HARD MODE", "hard_toggle")],
       [Markup.button.callback("💼 SELL ALL NOW", "hard_sellall")],
@@ -576,7 +739,7 @@ bot.action("hard_sellall", async ctx => {
     const holdings = await getTokenHoldings();
     let ok = 0, fail = 0;
     for (const h of holdings) {
-      try { await sellAll(h.mint); delete POSITIONS[h.mint]; ok++; } catch { fail++; }
+      try { await sellAllWithRetry(h.mint); delete POSITIONS[h.mint]; ok++; } catch { fail++; }
     }
     savePositions();
     await ctx.reply(`✅ SELL ALL: ${ok} sukses, ${fail} gagal`);
@@ -606,7 +769,7 @@ bot.action("holdings", async ctx => {
 
 bot.action(/^sellall_(.+)$/, async ctx => {
   const mint = ctx.match[1];
-  try { await ctx.answerCbQuery("Jual..."); await sellAll(mint); delete POSITIONS[mint]; savePositions(); await ctx.reply(`✅ sold \`${mint.slice(0,8)}\``, { parse_mode: "Markdown" }); }
+  try { await ctx.answerCbQuery("Jual..."); await sellAllWithRetry(mint); delete POSITIONS[mint]; savePositions(); await ctx.reply(`✅ sold \`${mint.slice(0,8)}\``, { parse_mode: "Markdown" }); }
   catch (e) { await ctx.reply(`❌ gagal: ${e.message}`); }
 });
 
@@ -622,7 +785,7 @@ bot.action("wallet", async ctx => {
   } catch (e) { try { await ctx.answerCbQuery("❌ " + e.message, { show_alert: true }); } catch {} }
 });
 
-// ============ LAPORAN TIAP 10 MENIT ============
+// ============ LAPORAN 10 MENIT ============
 async function reportLoop() {
   while (true) {
     await new Promise(r => setTimeout(r, REPORT_MINUTES * 60 * 1000));
@@ -655,13 +818,11 @@ async function reportLoop() {
         (posLines ? `*Detail:*\n${posLines}` : `_Tidak ada posisi terbuka._`);
 
       await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: "Markdown" });
-    } catch (e) {
-      console.error("reportLoop error:", e.message);
-    }
+    } catch (e) { console.error("reportLoop error:", e.message); }
   }
 }
 
-// ============ RATE REFRESH ============
+// ============ RATE LOOP ============
 async function rateLoop() {
   await updatePrices();
   while (true) {
@@ -679,4 +840,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — PDA-READY + IDR AUTO 📈");
+console.log("📈 LANOX BOT RUNNING — MANUAL PDA + IDR AUTO 📈");

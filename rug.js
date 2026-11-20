@@ -9,6 +9,7 @@ import {
 import {
   getAssociatedTokenAddress, TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountIdempotentInstruction,
 } from "@solana/spl-token";
 import { Telegraf, Markup } from "telegraf";
 import bs58 from "bs58";
@@ -272,6 +273,16 @@ async function buildBuyIx(mintStr, solAmount) {
 
   if (minTokensOut <= 0n) throw new Error("min tokens zero");
 
+  // FIX: bikin ATA user dulu pakai program yang sesuai mint
+  const ixAta = createAssociatedTokenAccountIdempotentInstruction(
+    wallet.publicKey,
+    associatedUser,
+    wallet.publicKey,
+    mint,
+    mintProgram,
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+
   const data = Buffer.alloc(24);
   BUY_DISC.copy(data, 0);
   data.writeBigUInt64LE(minTokensOut, 8);
@@ -296,7 +307,7 @@ async function buildBuyIx(mintStr, solAmount) {
     data,
   });
 
-  return { instructions: [ixBuy], expectedTokens: tokensOut, minTokensOut };
+  return { instructions: [ixAta, ixBuy], expectedTokens: tokensOut, minTokensOut };
 }
 
 async function buildSellIx(mintStr, tokenAmount) {
@@ -494,36 +505,30 @@ async function analyze({ mint }) {
 
     const scores = {};
 
-    // 1. holder concentration (20%)
     if (concentration.top10 < 30) scores.holders = 100;
     else if (concentration.top10 < 45) scores.holders = 80;
     else if (concentration.top10 < 60) scores.holders = 50;
     else scores.holders = 20;
 
-    // 2. likuiditas (15%)
     if (liqSol > 80) scores.liquidity = 100;
     else if (liqSol > 50) scores.liquidity = 80;
     else if (liqSol > 30) scores.liquidity = 60;
     else scores.liquidity = 40;
 
-    // 3. aktivitas 5 menit (25%)
     if (activity.txCount5m > 50) scores.activity = 100;
     else if (activity.txCount5m > 20) scores.activity = 80;
     else if (activity.txCount5m > 5) scores.activity = 50;
     else if (activity.txCount5m > 0) scores.activity = 30;
     else scores.activity = 0;
 
-    // 4. SOL raised (15%)
     if (raisedSol > 60) scores.raised = 100;
     else if (raisedSol > 30) scores.raised = 80;
     else if (raisedSol > 10) scores.raised = 60;
     else if (raisedSol > 3) scores.raised = 40;
     else scores.raised = 20;
 
-    // 5. mint authority (10%)
     scores.authority = mintAuth ? 50 : 100;
 
-    // 6. holder count (15%)
     if (concentration.count > 60) scores.holders_count = 100;
     else if (concentration.count > 30) scores.holders_count = 80;
     else if (concentration.count > 10) scores.holders_count = 50;
@@ -672,7 +677,6 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     if (!mint) return;
 
     const res = await analyze({ mint });
-    // log cuma yang skor > 0 atau yang lolos filter keras dengan alasan jelas
     if (res.score > 0 || res.reason.startsWith("age") || res.reason.startsWith("tx5m")) {
       console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason} | pot ${buyAmount.toFixed(4)} SOL (${fmtIdr(buyAmount)})`);
     }
@@ -893,4 +897,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — TOKEN-2022 READY + FULL ON-CHAIN + IDR 📈");
+console.log("📈 LANOX BOT RUNNING — ATA AUTO + TOKEN-2022 + ON-CHAIN 📈");

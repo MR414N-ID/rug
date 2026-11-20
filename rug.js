@@ -35,6 +35,9 @@ const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
 const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "2000");
 const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "1500");
 
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
 // ============ RPC HELPERS ============
@@ -142,7 +145,6 @@ async function analyze({ mint }) {
       getFreezeAuthority(mint),
     ]);
 
-    // filter keras
     if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq ${liqSol.toFixed(1)} < ${MIN_LIQ_SOL}` };
     if (freezeAuth) return { score: 0, reason: `freeze authority aktif` };
     if (concentration.top10 > 85) return { score: 0, reason: `top10 ${concentration.top10}% > 85%` };
@@ -177,7 +179,6 @@ async function analyze({ mint }) {
     else if (volume.priceChange5m >= 100) momentumScore = Math.max(0, momentumScore - 30);
 
     scores.volume = Math.round((volScore * 0.6) + (momentumScore * 0.4));
-
     scores.authority = mintAuth ? 50 : 100;
 
     if (concentration.count > 60) scores.holders_count = 100;
@@ -332,7 +333,7 @@ async function getPnl(mint) {
   return { pnlSol: +pnlSol.toFixed(4), pnlPct: +((pnlSol / pos.entrySol) * 100).toFixed(1) };
 }
 
-// ============ AUTO MONITOR ============
+// ============ AUTO MONITOR (FIX: filter mint bener) ============
 const seenSignatures = new Set();
 let lastAnalyzeTime = 0;
 
@@ -373,9 +374,28 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     }
     if (!tx || !tx.transaction || !tx.transaction.message) return;
 
+    // FIX: ambil kandidat mint, buang wSOL/USDC
     const postBalances = tx.meta?.postTokenBalances || [];
-    const mint = postBalances[0]?.mint;
-    if (!mint) return;
+    const candidates = [...new Set(postBalances.map(b => b.mint).filter(Boolean))]
+      .filter(m => m !== WSOL_MINT && m !== USDC_MINT);
+
+    if (!candidates.length) {
+      console.log(`skip ${signature.slice(0, 8)}: no candidate mint`);
+      return;
+    }
+
+    // FIX: pilih kandidat yang beneran punya bonding curve Pump.fun
+    let mint = null;
+    for (const c of candidates) {
+      try {
+        const pData = await sdk.fetchBuyState(new PublicKey(c), wallet.publicKey);
+        if (pData?.bondingCurve) { mint = c; break; }
+      } catch {}
+    }
+    if (!mint) {
+      console.log(`skip ${signature.slice(0, 8)}: no bonding curve (${candidates.length} kandidat)`);
+      return;
+    }
 
     const res = await analyze({ mint });
     console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);

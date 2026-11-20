@@ -23,6 +23,7 @@ const PRIVATE_KEY     = process.env.WALLET_PRIVATE_KEY;
 const MAIN_WALLET     = process.env.MAIN_WALLET_ADDRESS || "";
 const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const FEE_PROGRAM_STR = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const POSITIONS_FILE  = "./positions.json";
 
 const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "50");
@@ -41,6 +42,7 @@ const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "800");
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const FEE_PROGRAM_ID = new PublicKey(FEE_PROGRAM_STR);
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
@@ -133,7 +135,7 @@ async function getMintProgram(mintStr) {
   } catch { return TOKEN_PROGRAM_ID; }
 }
 
-// ============ PDAs & BONDING CURVE ============
+// ============ PDAs ============
 function getBondingCurvePDA(mintStr) {
   const mint = new PublicKey(mintStr);
   const [pda] = PublicKey.findProgramAddressSync(
@@ -157,7 +159,6 @@ function getCreatorVaultPDA(creator) {
   );
   return pda;
 }
-// FIX: PDA baru buat global + user volume accumulator
 function getGlobalVolumeAccumulatorPDA() {
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("global_volume_accumulator")],
@@ -169,6 +170,13 @@ function getUserVolumeAccumulatorPDA(user) {
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("user_volume_accumulator"), user.toBuffer()],
     PUMP_PROGRAM
+  );
+  return pda;
+}
+function getFeeConfigPDA() {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("fee_config")],
+    FEE_PROGRAM_ID
   );
   return pda;
 }
@@ -282,6 +290,7 @@ async function buildBuyIx(mintStr, solAmount) {
   const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, mintProgram);
   const globalVolAcc = getGlobalVolumeAccumulatorPDA();
   const userVolAcc = getUserVolumeAccumulatorPDA(wallet.publicKey);
+  const feeConfig = getFeeConfigPDA();
 
   const solLamports = BigInt(Math.floor(solAmount * 1e9));
   const solAfterFee = solLamports * 99n / 100n;
@@ -321,6 +330,8 @@ async function buildBuyIx(mintStr, solAmount) {
       { pubkey: PUMP_PROGRAM,              isSigner: false, isWritable: false },
       { pubkey: globalVolAcc,              isSigner: false, isWritable: true  },
       { pubkey: userVolAcc,                isSigner: false, isWritable: true  },
+      { pubkey: feeConfig,                 isSigner: false, isWritable: false },
+      { pubkey: FEE_PROGRAM_ID,            isSigner: false, isWritable: false },
     ],
     data,
   });
@@ -341,6 +352,7 @@ async function buildSellIx(mintStr, tokenAmount) {
   const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, mintProgram);
   const globalVolAcc = getGlobalVolumeAccumulatorPDA();
   const userVolAcc = getUserVolumeAccumulatorPDA(wallet.publicKey);
+  const feeConfig = getFeeConfigPDA();
 
   const solOut = (tokenAmount * state.virtualSolReserves) / (state.virtualTokenReserves + tokenAmount);
   const solOutAfterFee = solOut * 99n / 100n;
@@ -369,6 +381,8 @@ async function buildSellIx(mintStr, tokenAmount) {
       { pubkey: PUMP_PROGRAM,              isSigner: false, isWritable: false },
       { pubkey: globalVolAcc,              isSigner: false, isWritable: true  },
       { pubkey: userVolAcc,                isSigner: false, isWritable: true  },
+      { pubkey: feeConfig,                 isSigner: false, isWritable: false },
+      { pubkey: FEE_PROGRAM_ID,            isSigner: false, isWritable: false },
     ],
     data,
   });
@@ -919,4 +933,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — VOLUME ACC + TOKEN-2022 + ON-CHAIN 📈");
+console.log("📈 LANOX BOT RUNNING — FEE PROGRAM + VOLUME ACC + TOKEN-2022 📈");

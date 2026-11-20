@@ -24,21 +24,42 @@ const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 
-const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "65");
+const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "50");
 const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");
 const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");
 const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.06");
 const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.10");
 const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "8000");
-const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "12");
+const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "8");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
-const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "2000");
-const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "1500");
+const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
+const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "800");
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
+
+// ============ CURRENCY (SOL/USD/IDR) ============
+const priceCache = { solUsd: 140, usdIdr: 16000, lastUpdate: 0 };
+async function updatePrices() {
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd,idr");
+    const data = await res.json();
+    if (data.solana?.usd && data.solana?.idr) {
+      priceCache.solUsd = data.solana.usd;
+      priceCache.usdIdr = data.solana.idr / data.solana.usd;
+      priceCache.lastUpdate = Date.now();
+    }
+  } catch (e) { console.error("updatePrices:", e.message); }
+}
+function solToIdr(sol) { return Math.round(sol * priceCache.solUsd * priceCache.usdIdr); }
+function fmtIdr(sol) { return `Rp ${solToIdr(sol).toLocaleString('id-ID')}`; }
+function fmtSol(sol) { return `${sol.toFixed(4)} SOL (~${fmtIdr(sol)})`; }
+function fmtPnl(sol) {
+  const sign = sol >= 0 ? "+" : "-";
+  return `${sign}${Math.abs(sol).toFixed(4)} SOL (~${sign}${fmtIdr(Math.abs(sol))})`;
+}
 
 // ============ RPC HELPERS ============
 let isRpcBusy = false;
@@ -77,6 +98,7 @@ async function getLargestHolders(mint) {
 const connection = new Connection(RPC_URL, "confirmed");
 const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const sdk = new PumpSdk(connection);
+const PUMP_PROGRAM = new PublicKey(PUMP_PROGRAM_ID);
 
 async function getRawBalance() {
   return (await connection.getBalance(wallet.publicKey)) / 1e9;
@@ -87,6 +109,46 @@ async function getSafeBalance() {
   return usable > 0 ? usable : 0;
 }
 
+// ============ BONDING CURVE PDA (tanpa SDK) ============
+function getBondingCurvePDA(mintStr) {
+  const mint = new PublicKey(mintStr);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("bonding-curve"), mint.toBuffer()],
+    PUMP_PROGRAM
+  );
+  return pda;
+}
+
+async function isPumpToken(mintStr) {
+  try {
+    const pda = getBondingCurvePDA(mintStr);
+    const info = await connection.getAccountInfo(pda);
+    return !!info;
+  } catch { return false; }
+}
+
+async function getLiquidity(mint) {
+  try {
+    const pda = getBondingCurvePDA(mint);
+    const info = await connection.getAccountInfo(pda);
+    if (!info || info.data.length < 24) return 0;
+    const virtualSolReserves = info.data.readBigUInt64LE(16);
+    return Number(virtualSolReserves) / 1e9;
+  } catch { return 0; }
+}
+
+async function getCurrentPrice(mintStr) {
+  try {
+    const pda = getBondingCurvePDA(mintStr);
+    const info = await connection.getAccountInfo(pda);
+    if (!info || info.data.length < 24) return 0;
+    const virtualTokenReserves = info.data.readBigUInt64LE(8);
+    const virtualSolReserves = info.data.readBigUInt64LE(16);
+    if (virtualTokenReserves === 0n) return 0;
+    return Number(virtualSolReserves) / Number(virtualTokenReserves);
+  } catch { return 0; }
+}
+
 // ============ MULTI-SIGNAL ANALYZER ============
 async function getHolderConcentration(mint, supply) {
   const holders = await getLargestHolders(mint);
@@ -95,13 +157,6 @@ async function getHolderConcentration(mint, supply) {
   const top10 = amounts.slice(0, 10).reduce((a, b) => a + b, 0) / supply * 100;
   const top20 = amounts.slice(0, 20).reduce((a, b) => a + b, 0) / supply * 100;
   return { top10: +top10.toFixed(1), top20: +top20.toFixed(1), count: holders.length };
-}
-
-async function getLiquidity(mint) {
-  try {
-    const pData = await sdk.fetchBuyState(new PublicKey(mint), wallet.publicKey);
-    return parseFloat(pData.bondingCurve.virtualSolReserves.toString()) / 1e9;
-  } catch { return 0; }
 }
 
 async function getVolumeData(mint) {
@@ -147,7 +202,7 @@ async function analyze({ mint }) {
 
     if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq ${liqSol.toFixed(1)} < ${MIN_LIQ_SOL}` };
     if (freezeAuth) return { score: 0, reason: `freeze authority aktif` };
-    if (concentration.top10 > 85) return { score: 0, reason: `top10 ${concentration.top10}% > 85%` };
+    if (concentration.top10 > 90) return { score: 0, reason: `top10 ${concentration.top10}% > 90%` };
 
     const scores = {};
 
@@ -245,6 +300,22 @@ async function buy(mintStr, solAmount) {
   return sendIx(ix);
 }
 
+async function buyWithRetry(mintStr, solAmount) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await buy(mintStr, solAmount);
+    } catch (e) {
+      console.error(`buy attempt ${i+1} failed: ${e.message}`);
+      if (e.message.includes("could not find") || e.message.includes("does not exist") || e.message.includes("Account not found")) {
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("buy failed after 3 attempts");
+}
+
 async function sellAll(mintStr) {
   const mint = new PublicKey(mintStr);
   const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
@@ -283,14 +354,6 @@ function currentMaxCoins() {
   return Math.min(MAX_COINS_CFG, 4);
 }
 
-async function getCurrentPrice(mintStr) {
-  try {
-    const pData = await sdk.fetchBuyState(new PublicKey(mintStr), wallet.publicKey);
-    return parseFloat(pData.bondingCurve.virtualSolReserves.toString()) /
-           parseFloat(pData.bondingCurve.virtualTokenReserves.toString());
-  } catch { return 0; }
-}
-
 // ============ AUTO TP/SL ============
 async function hardModeLoop() {
   while (true) {
@@ -316,7 +379,9 @@ async function hardModeLoop() {
           if (CHAT_ID) {
             const emoji = pnl.pnlSol >= 0 ? "🟢" : "🔴";
             await bot.telegram.sendMessage(CHAT_ID,
-              `${emoji} *HARD ${reason}* ${mint.slice(0, 8)}\nPnL: ${pnl.pnlPct}% (${pnl.pnlSol.toFixed(4)} SOL)\ntx: \`${sig}\``,
+              `${emoji} *HARD ${reason}* ${mint.slice(0, 8)}\n` +
+              `PnL: ${pnl.pnlPct}% (${fmtPnl(pnl.pnlSol)})\n` +
+              `tx: \`${sig}\``,
               { parse_mode: "Markdown" });
           }
         }
@@ -333,7 +398,7 @@ async function getPnl(mint) {
   return { pnlSol: +pnlSol.toFixed(4), pnlPct: +((pnlSol / pos.entrySol) * 100).toFixed(1) };
 }
 
-// ============ AUTO MONITOR (FIX: filter mint bener) ============
+// ============ AUTO MONITOR ============
 const seenSignatures = new Set();
 let lastAnalyzeTime = 0;
 
@@ -374,23 +439,16 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     }
     if (!tx || !tx.transaction || !tx.transaction.message) return;
 
-    // FIX: ambil kandidat mint, buang wSOL/USDC
     const postBalances = tx.meta?.postTokenBalances || [];
     const candidates = [...new Set(postBalances.map(b => b.mint).filter(Boolean))]
       .filter(m => m !== WSOL_MINT && m !== USDC_MINT);
 
-    if (!candidates.length) {
-      console.log(`skip ${signature.slice(0, 8)}: no candidate mint`);
-      return;
-    }
+    if (!candidates.length) return;
 
-    // FIX: pilih kandidat yang beneran punya bonding curve Pump.fun
+    // FIX: deteksi via PDA, tanpa SDK
     let mint = null;
     for (const c of candidates) {
-      try {
-        const pData = await sdk.fetchBuyState(new PublicKey(c), wallet.publicKey);
-        if (pData?.bondingCurve) { mint = c; break; }
-      } catch {}
+      if (await isPumpToken(c)) { mint = c; break; }
     }
     if (!mint) {
       console.log(`skip ${signature.slice(0, 8)}: no bonding curve (${candidates.length} kandidat)`);
@@ -398,15 +456,20 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     }
 
     const res = await analyze({ mint });
-    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
+    const potIdr = fmtIdr(buyAmount);
+    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason} | pot beli ${buyAmount.toFixed(4)} SOL (${potIdr})`);
 
     if (res.score >= SCORE_THRESHOLD) {
-      const sig = await buy(mint, buyAmount);
+      const sig = await buyWithRetry(mint, buyAmount);
       const price = await getCurrentPrice(mint);
       POSITIONS[mint] = { entrySol: buyAmount, entryPrice: price, tokenAmount: buyAmount / price, peakPnlPct: 0, tx: sig };
       savePositions();
       if (CHAT_ID) await bot.telegram.sendMessage(CHAT_ID,
-        `🔥 *BUY* \`${mint.slice(0, 8)}\` | ${buyAmount.toFixed(4)} SOL | skor ${res.score} (${res.reason})\ntx: \`${sig}\``,
+        `🔥 *BUY* \`${mint.slice(0, 8)}\`\n` +
+        `Amount: *${buyAmount.toFixed(4)} SOL (~${potIdr})*\n` +
+        `Skor: ${res.score}\n` +
+        `${res.reason}\n` +
+        `tx: \`${sig}\``,
         { parse_mode: "Markdown" });
     }
   } catch (e) { console.error("onLogs error:", e.message); }
@@ -421,12 +484,17 @@ function menu() {
     [Markup.button.callback("📊 WALLET", "wallet")],
   ]);
 }
-const WELCOME_TEXT =
-  "📈 *LANOX TRADING MEME COIN* 📈\n\n" +
-  "🤖 *Status Bot:* Siap Beraksi\n" +
-  "💰 *Mode:* Hard Mode Compounding\n" +
-  "⚡ *Jaringan:* Solana (Pump.fun)\n\n" +
-  "Silakan pilih menu di bawah untuk mulai mencetak cuan:";
+function welcomeText() {
+  const rate = Math.round(priceCache.solUsd * priceCache.usdIdr);
+  return (
+    "📈 *LANOX TRADING MEME COIN* 📈\n\n" +
+    `💱 Rate: 1 SOL ≈ *Rp ${rate.toLocaleString('id-ID')}*\n` +
+    "🤖 Status: *Siap Beraksi*\n" +
+    "💰 Mode: Hard Mode Compounding\n" +
+    "⚡ Jaringan: Solana (Pump.fun)\n\n" +
+    "Silakan pilih menu di bawah:"
+  );
+}
 
 async function safeEdit(ctx, text, keyboard) {
   const opts = { parse_mode: "Markdown", ...keyboard };
@@ -435,13 +503,22 @@ async function safeEdit(ctx, text, keyboard) {
   try { await ctx.reply(text, opts); } catch (e) { console.error("safeEdit:", e.message); }
 }
 
-bot.start(ctx => ctx.replyWithPhoto(WELCOME_IMG, { caption: WELCOME_TEXT, parse_mode: "Markdown", ...menu() })
-  .catch(() => ctx.reply(WELCOME_TEXT, { parse_mode: "Markdown", ...menu() }).catch(() => {})));
-bot.action("menu", ctx => safeEdit(ctx, WELCOME_TEXT, menu()));
+bot.start(ctx => ctx.replyWithPhoto(WELCOME_IMG, { caption: welcomeText(), parse_mode: "Markdown", ...menu() })
+  .catch(() => ctx.reply(welcomeText(), { parse_mode: "Markdown", ...menu() }).catch(() => {})));
+bot.action("menu", ctx => safeEdit(ctx, welcomeText(), menu()));
 
 bot.action("hard_menu", async ctx => {
   const status = hardMode.active ? "🟢 ON" : "🔴 OFF";
-  const text = `🔥 *HARD MODE (COMPOUNDING)* 🔥\n\nStatus: ${status}\nMax Koin: ${currentMaxCoins()}\nCircuit Breaker: -50%\nScore Min: ${SCORE_THRESHOLD}\nSlippage: ${(SLIPPAGE_BUY*100).toFixed(0)}%/${(SLIPPAGE_SELL*100).toFixed(0)}%`;
+  const bal = await getRawBalance();
+  const text =
+    `🔥 *HARD MODE (COMPOUNDING)* 🔥\n\n` +
+    `Status: ${status}\n` +
+    `Max Koin: ${currentMaxCoins()}\n` +
+    `Score Min: ${SCORE_THRESHOLD}\n` +
+    `Slippage: ${(SLIPPAGE_BUY*100).toFixed(0)}%/${(SLIPPAGE_SELL*100).toFixed(0)}%\n` +
+    `Circuit: -50%\n\n` +
+    `Saldo: *${bal.toFixed(4)} SOL*\n` +
+    `(~${fmtIdr(bal)})`;
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback(hardMode.active ? "🔴 STOP HARD MODE" : "🟢 START HARD MODE", "hard_toggle")],
     [Markup.button.callback("💼 SELL ALL NOW", "hard_sellall")],
@@ -468,13 +545,22 @@ bot.action("hard_toggle", async ctx => {
           if (sendAmt > 0) {
             const ix = SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: new PublicKey(MAIN_WALLET), lamports: Math.floor(sendAmt * LAMPORTS_PER_SOL) });
             const sig = await sendIx([ix]);
-            await ctx.reply(`✅ *WITHDRAW OK*\n${sendAmt.toFixed(4)} SOL → main\ntx: \`${sig}\``, { parse_mode: "Markdown" });
+            await ctx.reply(`✅ *WITHDRAW OK*\n${sendAmt.toFixed(4)} SOL (~${fmtIdr(sendAmt)}) → main\ntx: \`${sig}\``, { parse_mode: "Markdown" });
           }
         } catch (e) { await ctx.reply(`❌ Withdraw gagal: ${e.message}`); }
       }
     }
     const status = hardMode.active ? "🟢 ON" : "🔴 OFF";
-    const text = `🔥 *HARD MODE (COMPOUNDING)* 🔥\n\nStatus: ${status}\nMax Koin: ${currentMaxCoins()}\nCircuit Breaker: -50%\nScore Min: ${SCORE_THRESHOLD}\nSlippage: ${(SLIPPAGE_BUY*100).toFixed(0)}%/${(SLIPPAGE_SELL*100).toFixed(0)}%`;
+    const bal = await getRawBalance();
+    const text =
+      `🔥 *HARD MODE (COMPOUNDING)* 🔥\n\n` +
+      `Status: ${status}\n` +
+      `Max Koin: ${currentMaxCoins()}\n` +
+      `Score Min: ${SCORE_THRESHOLD}\n` +
+      `Slippage: ${(SLIPPAGE_BUY*100).toFixed(0)}%/${(SLIPPAGE_SELL*100).toFixed(0)}%\n` +
+      `Circuit: -50%\n\n` +
+      `Saldo: *${bal.toFixed(4)} SOL*\n` +
+      `(~${fmtIdr(bal)})`;
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback(hardMode.active ? "🔴 STOP HARD MODE" : "🟢 START HARD MODE", "hard_toggle")],
       [Markup.button.callback("💼 SELL ALL NOW", "hard_sellall")],
@@ -505,7 +591,12 @@ bot.action("holdings", async ctx => {
     if (!holdings.length) text += "_Tidak ada token._";
     for (const h of holdings) {
       const pnl = await getPnl(h.mint);
-      text += pnl ? `- \`${h.mint.slice(0,6)}\` : ${pnl.pnlPct >= 0 ? "+" : ""}${pnl.pnlPct}%\n` : `- \`${h.mint.slice(0,6)}\`\n`;
+      if (pnl) {
+        text += `- \`${h.mint.slice(0,6)}\` : ${pnl.pnlPct >= 0 ? "+" : ""}${pnl.pnlPct}%\n`;
+        text += `  ${fmtPnl(pnl.pnlSol)}\n`;
+      } else {
+        text += `- \`${h.mint.slice(0,6)}\`\n`;
+      }
       btns.push([Markup.button.callback(`🔴 SELL ${h.mint.slice(0,6)}`, `sellall_${h.mint}`)]);
     }
     btns.push([Markup.button.callback("⬅️ menu", "menu")]);
@@ -522,7 +613,11 @@ bot.action(/^sellall_(.+)$/, async ctx => {
 bot.action("wallet", async ctx => {
   try {
     const bal = await getRawBalance();
-    const text = `📊 *WALLET BOT*\nSOL: *${bal.toFixed(4)}*\naddr: \`${wallet.publicKey.toBase58()}\``;
+    const text =
+      `📊 *WALLET BOT*\n\n` +
+      `SOL: *${bal.toFixed(4)}*\n` +
+      `IDR: *${fmtIdr(bal)}*\n\n` +
+      `addr: \`${wallet.publicKey.toBase58()}\``;
     await safeEdit(ctx, text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ menu", "menu")]]));
   } catch (e) { try { await ctx.answerCbQuery("❌ " + e.message, { show_alert: true }); } catch {} }
 });
@@ -543,21 +638,20 @@ async function reportLoop() {
         const pnl = await getPnl(h.mint);
         if (pnl) {
           totalPnlSol += pnl.pnlSol;
-          const sign = pnl.pnlPct >= 0 ? "+" : "";
-          posLines += `  • \`${h.mint.slice(0, 6)}\` ${sign}${pnl.pnlPct}% (${sign}${pnl.pnlSol} SOL)\n`;
+          posLines += `  • \`${h.mint.slice(0, 6)}\` ${pnl.pnlPct >= 0 ? "+" : ""}${pnl.pnlPct}% (${fmtPnl(pnl.pnlSol)})\n`;
         } else {
           posLines += `  • \`${h.mint.slice(0, 6)}\` —\n`;
         }
       }
 
       const status = hardMode.active ? "🟢 ON" : "🔴 OFF";
-      const pnlSign = totalPnlSol >= 0 ? "+" : "";
       const text =
         `📊 *LAPORAN ${REPORT_MINUTES} MENIT*\n\n` +
         `Status: ${status}\n` +
-        `Saldo: *${rawBal.toFixed(4)} SOL* (safe: ${safeBal.toFixed(4)})\n` +
+        `Saldo: *${rawBal.toFixed(4)} SOL* (~${fmtIdr(rawBal)})\n` +
+        `Safe: ${safeBal.toFixed(4)} SOL\n` +
         `Posisi: ${holdings.length}/${currentMaxCoins()}\n` +
-        `PnL terbuka: ${pnlSign}${totalPnlSol.toFixed(4)} SOL\n\n` +
+        `PnL terbuka: *${fmtPnl(totalPnlSol)}*\n\n` +
         (posLines ? `*Detail:*\n${posLines}` : `_Tidak ada posisi terbuka._`);
 
       await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: "Markdown" });
@@ -567,12 +661,22 @@ async function reportLoop() {
   }
 }
 
+// ============ RATE REFRESH ============
+async function rateLoop() {
+  await updatePrices();
+  while (true) {
+    await new Promise(r => setTimeout(r, 5 * 60 * 1000));
+    await updatePrices();
+  }
+}
+
 // ============ GUARDS ============
 process.on("unhandledRejection", r => console.error("⚠️ Unhandled:", r?.message || r));
 process.on("uncaughtException", e => console.error("⚠️ Uncaught:", e?.message || e));
 
 hardModeLoop().catch(e => console.error("loop crashed:", e.message));
 reportLoop().catch(e => console.error("report crashed:", e.message));
+rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — MULTI-SIGNAL AUTO-TUNED 📈");
+console.log("📈 LANOX BOT RUNNING — PDA-READY + IDR AUTO 📈");

@@ -24,21 +24,24 @@ const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 
-const SCORE_THRESHOLD = parseInt(process.env.SCORE_THRESHOLD || "82");
-const MAX_COINS_CFG   = parseInt(process.env.MAX_COINS || "2");
-const GAS_RESERVE     = parseFloat(process.env.GAS_RESERVE || "0.008");
-const SLIPPAGE_BUY    = parseFloat(process.env.SLIPPAGE_BUY || "0.06");
-const SLIPPAGE_SELL   = parseFloat(process.env.SLIPPAGE_SELL || "0.10");
-const PRIORITY_FEE    = parseInt(process.env.PRIORITY_FEE || "50000");
-const MIN_LIQ_SOL     = parseFloat(process.env.MIN_LIQ_SOL || "25");
-const REPORT_MINUTES  = parseInt(process.env.REPORT_MINUTES || "10");
+const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "82");
+const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");
+const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");
+const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.06");
+const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.10");
+const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "8000");
+const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "25");
+const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
+const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
+const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "4000");
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
-// ============ RPC HELPERS ============
+// ============ RPC HELPERS (exponential backoff) ============
 let isRpcBusy = false;
+let rpcDelay = RPC_DELAY_MS;
 async function rpc(method, params) {
-  if (isRpcBusy) await new Promise(r => setTimeout(r, 1500));
+  if (isRpcBusy) await new Promise(r => setTimeout(r, rpcDelay));
   isRpcBusy = true;
   try {
     const res = await fetch(RPC_URL, {
@@ -47,10 +50,15 @@ async function rpc(method, params) {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
     });
     const json = await res.json();
-    if (json.error && json.error.code === 429) await new Promise(r => setTimeout(r, 3000));
+    if (json.error && json.error.code === 429) {
+      rpcDelay = Math.min(rpcDelay * 2, 10000);
+      await new Promise(r => setTimeout(r, rpcDelay));
+    } else {
+      rpcDelay = Math.max(500, Math.floor(rpcDelay * 0.9));
+    }
     return json.result;
   } finally {
-    setTimeout(() => { isRpcBusy = false; }, 800);
+    setTimeout(() => { isRpcBusy = false; }, 300);
   }
 }
 
@@ -76,50 +84,129 @@ async function getSafeBalance() {
   return usable > 0 ? usable : 0;
 }
 
-// ============ ANALYZER ============
-async function analyze({ mint, devWallet }) {
-  try {
-    const holders = await getLargestHolders(mint);
-    const supply = await getTokenSupply(mint);
-    let devHoldPct = 0, top10Pct = 0;
-
-    if (supply > 0 && holders.length) {
-      for (const h of holders) {
-        const pct = parseInt(h.amount) / supply * 100;
-        if (h.address === devWallet) devHoldPct = pct;
-      }
-      top10Pct = holders.slice(0, 10).reduce((a, h) => a + parseInt(h.amount), 0) / supply * 100;
-    }
-
-    let liqSol = 0;
-    try {
-      const pData = await sdk.fetchBuyState(new PublicKey(mint), wallet.publicKey);
-      liqSol = parseFloat(pData.bondingCurve.virtualSolReserves.toString()) / 1e9;
-    } catch {}
-    if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq ${liqSol.toFixed(1)} SOL < ${MIN_LIQ_SOL}` };
-
-    let volumeScore = 0;
-    try {
-      const dexRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-      const dexData = await dexRes.json();
-      if (dexData.pairs && dexData.pairs.length > 0) {
-        const vol5m = parseFloat(dexData.pairs[0].volume?.m5 || "0");
-        if (vol5m > 1000) volumeScore = 100;
-        else if (vol5m > 100) volumeScore = 50;
-      }
-    } catch {}
-
-    const scores = {
-      dev_hold: devHoldPct < 3 ? 100 : devHoldPct < 7 ? 70 : 0,
-      top10: top10Pct < 35 ? 100 : top10Pct < 55 ? 70 : 0,
-      volume: volumeScore,
-    };
-    const total = (scores.dev_hold * 0.4) + (scores.top10 * 0.3) + (scores.volume * 0.3);
-    return { score: +total.toFixed(1), reason: `dev ${devHoldPct.toFixed(1)}% top10 ${top10Pct.toFixed(1)}% liq ${liqSol.toFixed(0)}` };
-  } catch (e) { return { score: 0, reason: e.message }; }
+// ============ MULTI-SIGNAL ANALYZER ============
+async function getHolderConcentration(mint, supply) {
+  const holders = await getLargestHolders(mint);
+  if (!holders.length || supply <= 0) return { top10: 100, top20: 100, count: 0 };
+  const amounts = holders.map(h => parseInt(h.amount)).sort((a, b) => b - a);
+  const top10 = amounts.slice(0, 10).reduce((a, b) => a + b, 0) / supply * 100;
+  const top20 = amounts.slice(0, 20).reduce((a, b) => a + b, 0) / supply * 100;
+  return { top10: +top10.toFixed(1), top20: +top20.toFixed(1), count: holders.length };
 }
 
-// ============ SEND IX (priority fee + retry) ============
+async function getLiquidity(mint) {
+  try {
+    const pData = await sdk.fetchBuyState(new PublicKey(mint), wallet.publicKey);
+    return parseFloat(pData.bondingCurve.virtualSolReserves.toString()) / 1e9;
+  } catch { return 0; }
+}
+
+async function getVolumeData(mint) {
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+    const data = await res.json();
+    if (!data.pairs || !data.pairs.length) return { vol5m: 0, vol1h: 0, buys5m: 0, sells5m: 0, priceChange5m: 0 };
+    const p = data.pairs[0];
+    return {
+      vol5m: parseFloat(p.volume?.m5 || "0"),
+      vol1h: parseFloat(p.volume?.h1 || "0"),
+      buys5m: parseInt(p.txns?.m5?.buys || "0"),
+      sells5m: parseInt(p.txns?.m5?.sells || "0"),
+      priceChange5m: parseFloat(p.priceChange?.m5 || "0"),
+    };
+  } catch { return { vol5m: 0, vol1h: 0, buys5m: 0, sells5m: 0, priceChange5m: 0 }; }
+}
+
+async function getMintAuthority(mint) {
+  try {
+    const info = await connection.getParsedAccountInfo(new PublicKey(mint));
+    return info.value?.data?.parsed?.info?.mintAuthority || null;
+  } catch { return null; }
+}
+
+async function getFreezeAuthority(mint) {
+  try {
+    const info = await connection.getParsedAccountInfo(new PublicKey(mint));
+    return info.value?.data?.parsed?.info?.freezeAuthority || null;
+  } catch { return null; }
+}
+
+async function analyze({ mint }) {
+  try {
+    const supply = await getTokenSupply(mint);
+    const [concentration, liqSol, volume, mintAuth, freezeAuth] = await Promise.all([
+      getHolderConcentration(mint, supply),
+      getLiquidity(mint),
+      getVolumeData(mint),
+      getMintAuthority(mint),
+      getFreezeAuthority(mint),
+    ]);
+
+    // filter keras
+    if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq ${liqSol.toFixed(1)} < ${MIN_LIQ_SOL}` };
+    if (freezeAuth) return { score: 0, reason: `freeze authority aktif` };
+    if (concentration.top10 > 70) return { score: 0, reason: `top10 ${concentration.top10}% > 70%` };
+
+    const scores = {};
+
+    // konsentrasi holder (25%)
+    if (concentration.top10 < 30) scores.holders = 100;
+    else if (concentration.top10 < 45) scores.holders = 80;
+    else if (concentration.top10 < 60) scores.holders = 50;
+    else scores.holders = 0;
+
+    // likuiditas (20%)
+    if (liqSol > 80) scores.liquidity = 100;
+    else if (liqSol > 50) scores.liquidity = 80;
+    else if (liqSol > 30) scores.liquidity = 60;
+    else scores.liquidity = 40;
+
+    // volume & momentum (25%)
+    let volScore = 0;
+    if (volume.vol5m > 2000) volScore = 100;
+    else if (volume.vol5m > 500) volScore = 80;
+    else if (volume.vol5m > 100) volScore = 50;
+    else volScore = 0;
+
+    let momentumScore = 0;
+    if (volume.buys5m + volume.sells5m > 0) {
+      const buyRatio = volume.buys5m / (volume.buys5m + volume.sells5m);
+      if (buyRatio > 0.65) momentumScore = 100;
+      else if (buyRatio > 0.55) momentumScore = 70;
+      else if (buyRatio > 0.45) momentumScore = 40;
+      else momentumScore = 0;
+    }
+    if (volume.priceChange5m > 5 && volume.priceChange5m < 50) momentumScore = Math.min(100, momentumScore + 20);
+    else if (volume.priceChange5m >= 100) momentumScore = Math.max(0, momentumScore - 30);
+
+    scores.volume = Math.round((volScore * 0.6) + (momentumScore * 0.4));
+
+    // authority (15%)
+    scores.authority = mintAuth ? 50 : 100;
+
+    // holder count (15%)
+    if (concentration.count > 100) scores.holders_count = 100;
+    else if (concentration.count > 50) scores.holders_count = 80;
+    else if (concentration.count > 20) scores.holders_count = 50;
+    else scores.holders_count = 20;
+
+    const total =
+      scores.holders * 0.25 +
+      scores.liquidity * 0.20 +
+      scores.volume * 0.25 +
+      scores.authority * 0.15 +
+      scores.holders_count * 0.15;
+
+    return {
+      score: +total.toFixed(1),
+      reason: `top10 ${concentration.top10}% liq ${liqSol.toFixed(0)} vol5m $${volume.vol5m.toFixed(0)} buy ${volume.buys5m}/${volume.sells5m} auth ${mintAuth ? "ada" : "revoked"}`,
+    };
+  } catch (e) {
+    return { score: 0, reason: `analyze error: ${e.message}` };
+  }
+}
+
+// ============ SEND IX ============
 async function sendIx(instructions, extraSigners = []) {
   const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE });
   const allIx = [priorityIx, ...instructions];
@@ -145,7 +232,7 @@ async function sendIx(instructions, extraSigners = []) {
   throw lastErr;
 }
 
-// ============ BUY / SELL (slippage bener) ============
+// ============ BUY / SELL ============
 async function buy(mintStr, solAmount) {
   const mint = new PublicKey(mintStr);
   const lamports = Math.floor(solAmount * 1e9);
@@ -250,21 +337,30 @@ async function getPnl(mint) {
   return { pnlSol: +pnlSol.toFixed(4), pnlPct: +((pnlSol / pos.entrySol) * 100).toFixed(1) };
 }
 
-// ============ AUTO MONITOR ============
+// ============ AUTO MONITOR (anti-spam + cooldown) ============
+const seenSignatures = new Set();
+let lastAnalyzeTime = 0;
+
 connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) => {
   try {
     if (!hardMode.active) return;
     if (!logs.some(l => l.includes("Instruction: Create"))) return;
 
+    // dedupe
+    if (seenSignatures.has(signature)) return;
+    seenSignatures.add(signature);
+    if (seenSignatures.size > 2000) seenSignatures.clear();
+
+    // cooldown global
+    const now = Date.now();
+    if (now - lastAnalyzeTime < ANALYZE_COOLDOWN) return;
+    lastAnalyzeTime = now;
+
     const rawBal = await getRawBalance();
-    if (rawBal < GAS_RESERVE + 0.005) {
-      console.log(`skip ${signature.slice(0, 8)}: saldo ${rawBal.toFixed(4)} SOL < minimum`);
-      return;
-    }
+    if (rawBal < GAS_RESERVE + 0.005) return;
 
     const holdings = await getTokenHoldings();
-    const maxC = currentMaxCoins();
-    if (holdings.length >= maxC) return;
+    if (holdings.length >= currentMaxCoins()) return;
 
     const safeBalance = await getSafeBalance();
     if (safeBalance <= (hardMode.initialBalance * hardMode.maxLossLimit)) {
@@ -273,7 +369,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
       return;
     }
 
-    const buyAmount = safeBalance / maxC;
+    const buyAmount = safeBalance / currentMaxCoins();
     if (buyAmount < 0.003) return;
 
     let tx = null;
@@ -282,20 +378,13 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
       if (tx) break;
       await new Promise(r => setTimeout(r, 1000));
     }
-    if (!tx || !tx.transaction || !tx.transaction.message) {
-      console.log(`skip ${signature.slice(0, 8)}: tx belum tersedia`);
-      return;
-    }
+    if (!tx || !tx.transaction || !tx.transaction.message) return;
 
     const postBalances = tx.meta?.postTokenBalances || [];
     const mint = postBalances[0]?.mint;
-    if (!mint) { console.log(`skip ${signature.slice(0, 8)}: no mint`); return; }
+    if (!mint) return;
 
-    const accountKeys = tx.transaction.message.accountKeys || [];
-    const devWallet = accountKeys[0]?.toString() || "";
-    if (!devWallet) { console.log(`skip ${signature.slice(0, 8)}: no dev`); return; }
-
-    const res = await analyze({ mint, devWallet });
+    const res = await analyze({ mint });
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await buy(mint, buyAmount);
       const price = await getCurrentPrice(mint);
@@ -305,7 +394,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
         `🔥 *BUY* \`${mint.slice(0, 8)}\` | ${buyAmount.toFixed(4)} SOL | skor ${res.score} (${res.reason})\ntx: \`${sig}\``,
         { parse_mode: "Markdown" });
     }
-  } catch (e) { console.error("onLogs error:", e.stack || e.message); }
+  } catch (e) { console.error("onLogs error:", e.message); }
 }, "confirmed");
 
 // ============ BOT UI ============
@@ -471,4 +560,4 @@ hardModeLoop().catch(e => console.error("loop crashed:", e.message));
 reportLoop().catch(e => console.error("report crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — FULL AUTO-TUNED 📈");
+console.log("📈 LANOX BOT RUNNING — MULTI-SIGNAL AUTO-TUNED 📈");

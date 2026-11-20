@@ -9,7 +9,6 @@ import {
 import {
   getAssociatedTokenAddress, TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  createAssociatedTokenAccountIdempotentInstruction,
 } from "@solana/spl-token";
 import { Telegraf, Markup } from "telegraf";
 import bs58 from "bs58";
@@ -176,7 +175,7 @@ async function getCurrentPrice(mintStr) {
   } catch { return 0; }
 }
 
-// ============ FEE RECIPIENT (baca dari global account) ============
+// ============ FEE RECIPIENT ============
 let cachedFeeRecipient = null;
 async function getFeeRecipient() {
   if (cachedFeeRecipient) return cachedFeeRecipient;
@@ -184,12 +183,10 @@ async function getFeeRecipient() {
     const globalPDA = getGlobalPDA();
     const info = await connection.getAccountInfo(globalPDA);
     if (info && info.data.length >= 73) {
-      // layout: disc(8) + initialized(1) + authority(32) + fee_recipient(32)
       cachedFeeRecipient = new PublicKey(info.data.slice(41, 73));
       return cachedFeeRecipient;
     }
   } catch (e) { console.error("getFeeRecipient:", e.message); }
-  // fallback
   cachedFeeRecipient = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
   return cachedFeeRecipient;
 }
@@ -210,9 +207,7 @@ async function buildBuyIx(mintStr, solAmount) {
   const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
 
   const solLamports = BigInt(Math.floor(solAmount * 1e9));
-  // fee Pump.fun 1%
   const solAfterFee = solLamports * 99n / 100n;
-  // constant product: tokens_out = vToken * solIn / (vSol + solIn)
   const tokensOut = (solAfterFee * state.virtualTokenReserves) / (state.virtualSolReserves + solAfterFee);
   const minTokensOut = tokensOut * BigInt(Math.floor((1 - SLIPPAGE_BUY) * 100)) / 100n;
 
@@ -220,8 +215,8 @@ async function buildBuyIx(mintStr, solAmount) {
 
   const data = Buffer.alloc(24);
   BUY_DISC.copy(data, 0);
-  data.writeBigUInt64LE(minTokensOut, 8);  // amount (min tokens)
-  data.writeBigUInt64LE(solLamports, 16);  // max_sol_cost
+  data.writeBigUInt64LE(minTokensOut, 8);
+  data.writeBigUInt64LE(solLamports, 16);
 
   const ixBuy = new TransactionInstruction({
     programId: PUMP_PROGRAM,
@@ -242,12 +237,7 @@ async function buildBuyIx(mintStr, solAmount) {
     data,
   });
 
-  // idempotent ATA creation sebelum buy (aman kalau udah ada)
-  const ixAta = createAssociatedTokenAccountIdempotentInstruction(
-    wallet.publicKey, associatedUser, wallet.publicKey, mint
-  );
-
-  return { instructions: [ixAta, ixBuy], expectedTokens: tokensOut, minTokensOut };
+  return { instructions: [ixBuy], expectedTokens: tokensOut, minTokensOut };
 }
 
 async function buildSellIx(mintStr, tokenAmount) {
@@ -261,15 +251,14 @@ async function buildSellIx(mintStr, tokenAmount) {
   const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true);
   const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
 
-  // expected SOL out
   const solOut = (tokenAmount * state.virtualSolReserves) / (state.virtualTokenReserves + tokenAmount);
   const solOutAfterFee = solOut * 99n / 100n;
   const minSolOut = solOutAfterFee * BigInt(Math.floor((1 - SLIPPAGE_SELL) * 100)) / 100n;
 
   const data = Buffer.alloc(24);
   SELL_DISC.copy(data, 0);
-  data.writeBigUInt64LE(tokenAmount, 8);  // amount (tokens to sell)
-  data.writeBigUInt64LE(minSolOut, 16);   // min_sol_output
+  data.writeBigUInt64LE(tokenAmount, 8);
+  data.writeBigUInt64LE(minSolOut, 16);
 
   return new TransactionInstruction({
     programId: PUMP_PROGRAM,
@@ -523,7 +512,6 @@ async function hardModeLoop() {
         const pos = POSITIONS[mint];
         if (!pos.peakPnlPct || pnl.pnlPct > pos.peakPnlPct) { pos.peakPnlPct = pnl.pnlPct; savePositions(); }
 
-        // cek kalau token udah graduated - jual paksa
         const state = await getBondingCurveState(mint);
         if (state?.complete) {
           console.log(`[${mint.slice(0,8)}] graduated, forced sell attempt`);

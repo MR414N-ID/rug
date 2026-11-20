@@ -157,6 +157,21 @@ function getCreatorVaultPDA(creator) {
   );
   return pda;
 }
+// FIX: PDA baru buat global + user volume accumulator
+function getGlobalVolumeAccumulatorPDA() {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("global_volume_accumulator")],
+    PUMP_PROGRAM
+  );
+  return pda;
+}
+function getUserVolumeAccumulatorPDA(user) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("user_volume_accumulator"), user.toBuffer()],
+    PUMP_PROGRAM
+  );
+  return pda;
+}
 
 async function isPumpToken(mintStr) {
   try {
@@ -265,6 +280,8 @@ async function buildBuyIx(mintStr, solAmount) {
   const creatorVault = getCreatorVaultPDA(state.creator);
   const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, mintProgram);
   const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, mintProgram);
+  const globalVolAcc = getGlobalVolumeAccumulatorPDA();
+  const userVolAcc = getUserVolumeAccumulatorPDA(wallet.publicKey);
 
   const solLamports = BigInt(Math.floor(solAmount * 1e9));
   const solAfterFee = solLamports * 99n / 100n;
@@ -273,7 +290,6 @@ async function buildBuyIx(mintStr, solAmount) {
 
   if (minTokensOut <= 0n) throw new Error("min tokens zero");
 
-  // FIX: bikin ATA user dulu pakai program yang sesuai mint
   const ixAta = createAssociatedTokenAccountIdempotentInstruction(
     wallet.publicKey,
     associatedUser,
@@ -291,18 +307,20 @@ async function buildBuyIx(mintStr, solAmount) {
   const ixBuy = new TransactionInstruction({
     programId: PUMP_PROGRAM,
     keys: [
-      { pubkey: getGlobalPDA(),          isSigner: false, isWritable: false },
-      { pubkey: feeRecipient,            isSigner: false, isWritable: true  },
-      { pubkey: mint,                    isSigner: false, isWritable: false },
-      { pubkey: state.pda,               isSigner: false, isWritable: true  },
-      { pubkey: associatedBondingCurve,  isSigner: false, isWritable: true  },
-      { pubkey: associatedUser,          isSigner: false, isWritable: true  },
-      { pubkey: wallet.publicKey,        isSigner: true,  isWritable: true  },
-      { pubkey: SYS_PROGRAM,             isSigner: false, isWritable: false },
-      { pubkey: mintProgram,             isSigner: false, isWritable: false },
-      { pubkey: creatorVault,            isSigner: false, isWritable: true  },
-      { pubkey: getEventAuthorityPDA(),  isSigner: false, isWritable: false },
-      { pubkey: PUMP_PROGRAM,            isSigner: false, isWritable: false },
+      { pubkey: getGlobalPDA(),            isSigner: false, isWritable: false },
+      { pubkey: feeRecipient,              isSigner: false, isWritable: true  },
+      { pubkey: mint,                      isSigner: false, isWritable: false },
+      { pubkey: state.pda,                 isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve,    isSigner: false, isWritable: true  },
+      { pubkey: associatedUser,            isSigner: false, isWritable: true  },
+      { pubkey: wallet.publicKey,          isSigner: true,  isWritable: true  },
+      { pubkey: SYS_PROGRAM,               isSigner: false, isWritable: false },
+      { pubkey: mintProgram,               isSigner: false, isWritable: false },
+      { pubkey: creatorVault,              isSigner: false, isWritable: true  },
+      { pubkey: getEventAuthorityPDA(),    isSigner: false, isWritable: false },
+      { pubkey: PUMP_PROGRAM,              isSigner: false, isWritable: false },
+      { pubkey: globalVolAcc,              isSigner: false, isWritable: true  },
+      { pubkey: userVolAcc,                isSigner: false, isWritable: true  },
     ],
     data,
   });
@@ -321,6 +339,8 @@ async function buildSellIx(mintStr, tokenAmount) {
   const creatorVault = getCreatorVaultPDA(state.creator);
   const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, mintProgram);
   const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, mintProgram);
+  const globalVolAcc = getGlobalVolumeAccumulatorPDA();
+  const userVolAcc = getUserVolumeAccumulatorPDA(wallet.publicKey);
 
   const solOut = (tokenAmount * state.virtualSolReserves) / (state.virtualTokenReserves + tokenAmount);
   const solOutAfterFee = solOut * 99n / 100n;
@@ -334,19 +354,21 @@ async function buildSellIx(mintStr, tokenAmount) {
   return new TransactionInstruction({
     programId: PUMP_PROGRAM,
     keys: [
-      { pubkey: getGlobalPDA(),          isSigner: false, isWritable: false },
-      { pubkey: feeRecipient,            isSigner: false, isWritable: true  },
-      { pubkey: mint,                    isSigner: false, isWritable: false },
-      { pubkey: state.pda,               isSigner: false, isWritable: true  },
-      { pubkey: associatedBondingCurve,  isSigner: false, isWritable: true  },
-      { pubkey: associatedUser,          isSigner: false, isWritable: true  },
-      { pubkey: wallet.publicKey,        isSigner: true,  isWritable: true  },
-      { pubkey: SYS_PROGRAM,             isSigner: false, isWritable: false },
+      { pubkey: getGlobalPDA(),            isSigner: false, isWritable: false },
+      { pubkey: feeRecipient,              isSigner: false, isWritable: true  },
+      { pubkey: mint,                      isSigner: false, isWritable: false },
+      { pubkey: state.pda,                 isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve,    isSigner: false, isWritable: true  },
+      { pubkey: associatedUser,            isSigner: false, isWritable: true  },
+      { pubkey: wallet.publicKey,          isSigner: true,  isWritable: true  },
+      { pubkey: SYS_PROGRAM,               isSigner: false, isWritable: false },
       { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: mintProgram,             isSigner: false, isWritable: false },
-      { pubkey: creatorVault,            isSigner: false, isWritable: true  },
-      { pubkey: getEventAuthorityPDA(),  isSigner: false, isWritable: false },
-      { pubkey: PUMP_PROGRAM,            isSigner: false, isWritable: false },
+      { pubkey: mintProgram,               isSigner: false, isWritable: false },
+      { pubkey: creatorVault,              isSigner: false, isWritable: true  },
+      { pubkey: getEventAuthorityPDA(),    isSigner: false, isWritable: false },
+      { pubkey: PUMP_PROGRAM,              isSigner: false, isWritable: false },
+      { pubkey: globalVolAcc,              isSigner: false, isWritable: true  },
+      { pubkey: userVolAcc,                isSigner: false, isWritable: true  },
     ],
     data,
   });
@@ -454,7 +476,7 @@ async function getTokenHoldings() {
   return holdings;
 }
 
-// ============ ANALYZER (full on-chain) ============
+// ============ ANALYZER ============
 async function getHolderConcentration(mint, supply) {
   const holders = await getLargestHolders(mint);
   if (!holders.length || supply <= 0) return { top10: 100, top20: 100, count: 0 };
@@ -897,4 +919,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — ATA AUTO + TOKEN-2022 + ON-CHAIN 📈");
+console.log("📈 LANOX BOT RUNNING — VOLUME ACC + TOKEN-2022 + ON-CHAIN 📈");

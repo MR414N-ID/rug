@@ -124,11 +124,12 @@ async function getSafeBalance() {
 }
 
 // ============ MINT PROGRAM DETECTION ============
-async function isToken2022(mintStr) {
+async function getMintProgram(mintStr) {
   try {
     const info = await connection.getParsedAccountInfo(new PublicKey(mintStr));
-    return info.value?.owner?.equals(TOKEN_2022_PROGRAM_ID) || false;
-  } catch { return false; }
+    if (info.value?.owner?.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
+    return TOKEN_PROGRAM_ID;
+  } catch { return TOKEN_PROGRAM_ID; }
 }
 
 // ============ PDAs & BONDING CURVE ============
@@ -196,16 +197,13 @@ async function getCurrentPrice(mintStr) {
   } catch { return 0; }
 }
 
-// ============ ON-CHAIN AGE + ACTIVITY (ganti DexScreener) ============
+// ============ ON-CHAIN AGE + ACTIVITY ============
 async function getTokenActivity(mintStr) {
-  // umur: signature tertua di mint account
-  // aktivitas: jumlah tx di bonding curve dalam 5 menit terakhir
   try {
     const mint = new PublicKey(mintStr);
     const pda = getBondingCurvePDA(mintStr);
     const now = Date.now() / 1000;
 
-    // umur dari mint signatures
     let ageHours = null;
     try {
       const mintSigs = await connection.getSignaturesForAddress(mint, { limit: 1000 });
@@ -217,7 +215,6 @@ async function getTokenActivity(mintStr) {
       }
     } catch {}
 
-    // aktivitas dari bonding curve signatures
     let txCount5m = 0;
     let txCount30m = 0;
     try {
@@ -262,10 +259,11 @@ async function buildBuyIx(mintStr, solAmount) {
   if (!state) throw new Error("bonding curve not found");
   if (state.complete) throw new Error("token graduated");
 
+  const mintProgram = await getMintProgram(mintStr);
   const feeRecipient = await getFeeRecipient();
   const creatorVault = getCreatorVaultPDA(state.creator);
-  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, TOKEN_PROGRAM_ID);
-  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, mintProgram);
+  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, mintProgram);
 
   const solLamports = BigInt(Math.floor(solAmount * 1e9));
   const solAfterFee = solLamports * 99n / 100n;
@@ -290,7 +288,7 @@ async function buildBuyIx(mintStr, solAmount) {
       { pubkey: associatedUser,          isSigner: false, isWritable: true  },
       { pubkey: wallet.publicKey,        isSigner: true,  isWritable: true  },
       { pubkey: SYS_PROGRAM,             isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID,        isSigner: false, isWritable: false },
+      { pubkey: mintProgram,             isSigner: false, isWritable: false },
       { pubkey: creatorVault,            isSigner: false, isWritable: true  },
       { pubkey: getEventAuthorityPDA(),  isSigner: false, isWritable: false },
       { pubkey: PUMP_PROGRAM,            isSigner: false, isWritable: false },
@@ -307,10 +305,11 @@ async function buildSellIx(mintStr, tokenAmount) {
   if (!state) throw new Error("bonding curve not found");
   if (state.complete) throw new Error("token graduated - sell on raydium");
 
+  const mintProgram = await getMintProgram(mintStr);
   const feeRecipient = await getFeeRecipient();
   const creatorVault = getCreatorVaultPDA(state.creator);
-  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, TOKEN_PROGRAM_ID);
-  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, mintProgram);
+  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, mintProgram);
 
   const solOut = (tokenAmount * state.virtualSolReserves) / (state.virtualTokenReserves + tokenAmount);
   const solOutAfterFee = solOut * 99n / 100n;
@@ -333,7 +332,7 @@ async function buildSellIx(mintStr, tokenAmount) {
       { pubkey: wallet.publicKey,        isSigner: true,  isWritable: true  },
       { pubkey: SYS_PROGRAM,             isSigner: false, isWritable: false },
       { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID,        isSigner: false, isWritable: false },
+      { pubkey: mintProgram,             isSigner: false, isWritable: false },
       { pubkey: creatorVault,            isSigner: false, isWritable: true  },
       { pubkey: getEventAuthorityPDA(),  isSigner: false, isWritable: false },
       { pubkey: PUMP_PROGRAM,            isSigner: false, isWritable: false },
@@ -402,7 +401,8 @@ async function buyWithRetry(mintStr, solAmount) {
 
 async function sellAll(mintStr) {
   const mint = new PublicKey(mintStr);
-  const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+  const mintProgram = await getMintProgram(mintStr);
+  const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, mintProgram);
   let info;
   try {
     info = await connection.getTokenAccountBalance(ata);
@@ -430,16 +430,20 @@ async function sellAllWithRetry(mintStr) {
 }
 
 async function getTokenHoldings() {
-  const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { programId: TOKEN_PROGRAM_ID });
   const holdings = [];
-  for (const acc of accounts.value) {
-    const info = acc.account.data.parsed.info;
-    if (info.tokenAmount.uiAmount > 0) holdings.push({ mint: info.mint, amount: info.tokenAmount.uiAmount });
+  for (const progId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+    try {
+      const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { programId: progId });
+      for (const acc of accounts.value) {
+        const info = acc.account.data.parsed.info;
+        if (info.tokenAmount.uiAmount > 0) holdings.push({ mint: info.mint, amount: info.tokenAmount.uiAmount });
+      }
+    } catch {}
   }
   return holdings;
 }
 
-// ============ ANALYZER (full on-chain, tanpa DexScreener) ============
+// ============ ANALYZER (full on-chain) ============
 async function getHolderConcentration(mint, supply) {
   const holders = await getLargestHolders(mint);
   if (!holders.length || supply <= 0) return { top10: 100, top20: 100, count: 0 };
@@ -464,8 +468,6 @@ async function getFreezeAuthority(mint) {
 
 async function analyze({ mint }) {
   try {
-    if (await isToken2022(mint)) return { score: 0, reason: `token-2022 skip` };
-
     const supply = await getTokenSupply(mint);
     const [concentration, state, activity, mintAuth, freezeAuth] = await Promise.all([
       getHolderConcentration(mint, supply),
@@ -504,14 +506,14 @@ async function analyze({ mint }) {
     else if (liqSol > 30) scores.liquidity = 60;
     else scores.liquidity = 40;
 
-    // 3. aktivitas 5 menit dari bonding curve signatures (25%)
+    // 3. aktivitas 5 menit (25%)
     if (activity.txCount5m > 50) scores.activity = 100;
     else if (activity.txCount5m > 20) scores.activity = 80;
     else if (activity.txCount5m > 5) scores.activity = 50;
     else if (activity.txCount5m > 0) scores.activity = 30;
     else scores.activity = 0;
 
-    // 4. SOL raised (proxy minat beli) (15%)
+    // 4. SOL raised (15%)
     if (raisedSol > 60) scores.raised = 100;
     else if (raisedSol > 30) scores.raised = 80;
     else if (raisedSol > 10) scores.raised = 60;
@@ -670,7 +672,10 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     if (!mint) return;
 
     const res = await analyze({ mint });
-    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason} | pot beli ${buyAmount.toFixed(4)} SOL (${fmtIdr(buyAmount)})`);
+    // log cuma yang skor > 0 atau yang lolos filter keras dengan alasan jelas
+    if (res.score > 0 || res.reason.startsWith("age") || res.reason.startsWith("tx5m")) {
+      console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason} | pot ${buyAmount.toFixed(4)} SOL (${fmtIdr(buyAmount)})`);
+    }
 
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await buyWithRetry(mint, buyAmount);
@@ -888,4 +893,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — FULL ON-CHAIN + IDR 📈");
+console.log("📈 LANOX BOT RUNNING — TOKEN-2022 READY + FULL ON-CHAIN + IDR 📈");

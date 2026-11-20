@@ -24,20 +24,20 @@ const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 
-const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "82");
+const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "65");
 const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");
 const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");
 const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.06");
 const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.10");
 const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "8000");
-const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "25");
+const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "12");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
-const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
-const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "4000");
+const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "2000");
+const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "1500");
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
-// ============ RPC HELPERS (exponential backoff) ============
+// ============ RPC HELPERS ============
 let isRpcBusy = false;
 let rpcDelay = RPC_DELAY_MS;
 async function rpc(method, params) {
@@ -145,23 +145,20 @@ async function analyze({ mint }) {
     // filter keras
     if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq ${liqSol.toFixed(1)} < ${MIN_LIQ_SOL}` };
     if (freezeAuth) return { score: 0, reason: `freeze authority aktif` };
-    if (concentration.top10 > 70) return { score: 0, reason: `top10 ${concentration.top10}% > 70%` };
+    if (concentration.top10 > 85) return { score: 0, reason: `top10 ${concentration.top10}% > 85%` };
 
     const scores = {};
 
-    // konsentrasi holder (25%)
     if (concentration.top10 < 30) scores.holders = 100;
     else if (concentration.top10 < 45) scores.holders = 80;
     else if (concentration.top10 < 60) scores.holders = 50;
-    else scores.holders = 0;
+    else scores.holders = 20;
 
-    // likuiditas (20%)
     if (liqSol > 80) scores.liquidity = 100;
     else if (liqSol > 50) scores.liquidity = 80;
     else if (liqSol > 30) scores.liquidity = 60;
     else scores.liquidity = 40;
 
-    // volume & momentum (25%)
     let volScore = 0;
     if (volume.vol5m > 2000) volScore = 100;
     else if (volume.vol5m > 500) volScore = 80;
@@ -181,13 +178,11 @@ async function analyze({ mint }) {
 
     scores.volume = Math.round((volScore * 0.6) + (momentumScore * 0.4));
 
-    // authority (15%)
     scores.authority = mintAuth ? 50 : 100;
 
-    // holder count (15%)
-    if (concentration.count > 100) scores.holders_count = 100;
-    else if (concentration.count > 50) scores.holders_count = 80;
-    else if (concentration.count > 20) scores.holders_count = 50;
+    if (concentration.count > 60) scores.holders_count = 100;
+    else if (concentration.count > 30) scores.holders_count = 80;
+    else if (concentration.count > 10) scores.holders_count = 50;
     else scores.holders_count = 20;
 
     const total =
@@ -337,7 +332,7 @@ async function getPnl(mint) {
   return { pnlSol: +pnlSol.toFixed(4), pnlPct: +((pnlSol / pos.entrySol) * 100).toFixed(1) };
 }
 
-// ============ AUTO MONITOR (anti-spam + cooldown) ============
+// ============ AUTO MONITOR ============
 const seenSignatures = new Set();
 let lastAnalyzeTime = 0;
 
@@ -346,12 +341,10 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     if (!hardMode.active) return;
     if (!logs.some(l => l.includes("Instruction: Create"))) return;
 
-    // dedupe
     if (seenSignatures.has(signature)) return;
     seenSignatures.add(signature);
     if (seenSignatures.size > 2000) seenSignatures.clear();
 
-    // cooldown global
     const now = Date.now();
     if (now - lastAnalyzeTime < ANALYZE_COOLDOWN) return;
     lastAnalyzeTime = now;
@@ -385,6 +378,8 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     if (!mint) return;
 
     const res = await analyze({ mint });
+    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
+
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await buy(mint, buyAmount);
       const price = await getCurrentPrice(mint);

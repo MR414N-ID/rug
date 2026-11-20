@@ -15,7 +15,7 @@ import bs58 from "bs58";
 import fetch from "node-fetch";
 import fs from "fs";
 
-// ============ CONFIG — AUTO-TUNED BUAT MODAL KECIL ============
+// ============ CONFIG ============
 const BOT_TOKEN       = process.env.BOT_TOKEN;
 const RPC_URL         = process.env.RPC_URL;
 const PRIVATE_KEY     = process.env.WALLET_PRIVATE_KEY;
@@ -24,14 +24,14 @@ const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 
-// AUTO-TUNE: kalau saldo kecil, maxCoins otomatis turun biar posisi lebih gede
-const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "82");   // naik dari 70 → selektif
-const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");          // turun dari 5 → 2
-const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");  // naik dari 0.005
-const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.06");  // turun dari 0.15
-const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.10"); // turun dari 0.20
-const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "50000");   // microLamports
-const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "25");     // skip bonding curve < 25 SOL
+const SCORE_THRESHOLD = parseInt(process.env.SCORE_THRESHOLD || "82");
+const MAX_COINS_CFG   = parseInt(process.env.MAX_COINS || "2");
+const GAS_RESERVE     = parseFloat(process.env.GAS_RESERVE || "0.008");
+const SLIPPAGE_BUY    = parseFloat(process.env.SLIPPAGE_BUY || "0.06");
+const SLIPPAGE_SELL   = parseFloat(process.env.SLIPPAGE_SELL || "0.10");
+const PRIORITY_FEE    = parseInt(process.env.PRIORITY_FEE || "50000");
+const MIN_LIQ_SOL     = parseFloat(process.env.MIN_LIQ_SOL || "25");
+const REPORT_MINUTES  = parseInt(process.env.REPORT_MINUTES || "10");
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
@@ -62,7 +62,21 @@ async function getLargestHolders(mint) {
   return (await rpc("getTokenLargestAccounts", [mint]))?.value || [];
 }
 
-// ============ ANALYZER — TAMBAH FILTER LIKUIDITAS ============
+// ============ TRADER ============
+const connection = new Connection(RPC_URL, "confirmed");
+const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+const sdk = new PumpSdk(connection);
+
+async function getRawBalance() {
+  return (await connection.getBalance(wallet.publicKey)) / 1e9;
+}
+async function getSafeBalance() {
+  const raw = await getRawBalance();
+  const usable = raw - GAS_RESERVE;
+  return usable > 0 ? usable : 0;
+}
+
+// ============ ANALYZER ============
 async function analyze({ mint, devWallet }) {
   try {
     const holders = await getLargestHolders(mint);
@@ -77,7 +91,6 @@ async function analyze({ mint, devWallet }) {
       top10Pct = holders.slice(0, 10).reduce((a, h) => a + parseInt(h.amount), 0) / supply * 100;
     }
 
-    // cek likuiditas bonding curve — skip kalau terlalu tipis
     let liqSol = 0;
     try {
       const pData = await sdk.fetchBuyState(new PublicKey(mint), wallet.publicKey);
@@ -106,21 +119,7 @@ async function analyze({ mint, devWallet }) {
   } catch (e) { return { score: 0, reason: e.message }; }
 }
 
-// ============ TRADER ============
-const connection = new Connection(RPC_URL, "confirmed");
-const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-const sdk = new PumpSdk(connection);
-
-async function getRawBalance() {
-  return (await connection.getBalance(wallet.publicKey)) / 1e9;
-}
-async function getSafeBalance() {
-  const raw = await getRawBalance();
-  const usable = raw - GAS_RESERVE;
-  return usable > 0 ? usable : 0;
-}
-
-// FIX: priority fee + retry + slippage bener
+// ============ SEND IX (priority fee + retry) ============
 async function sendIx(instructions, extraSigners = []) {
   const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE });
   const allIx = [priorityIx, ...instructions];
@@ -146,7 +145,7 @@ async function sendIx(instructions, extraSigners = []) {
   throw lastErr;
 }
 
-// FIX: hitung amount bener berdasarkan harga bonding curve
+// ============ BUY / SELL (slippage bener) ============
 async function buy(mintStr, solAmount) {
   const mint = new PublicKey(mintStr);
   const lamports = Math.floor(solAmount * 1e9);
@@ -195,7 +194,6 @@ function savePositions() { fs.writeFileSync(POSITIONS_FILE, JSON.stringify(POSIT
 
 const hardMode = { active: false, initialBalance: 0, maxLossLimit: 0.5 };
 function currentMaxCoins() {
-  // auto-tune: saldo < 0.04 SOL → 2 koin, saldo lebih → naik bertahap max 4
   const bal = hardMode.initialBalance || 0;
   if (bal < 0.04) return 2;
   if (bal < 0.08) return 3;
@@ -227,7 +225,7 @@ async function hardModeLoop() {
         else if (pos.peakPnlPct >= 60) trail = 15;
         else if (pos.peakPnlPct >= 40) trail = 10;
         else if (pos.peakPnlPct >= 20) trail = 5;
-        if (pnl.pnlPct <= -15) reason = "CUT LOSS";                         // lebih ketat: -15 bukan -20
+        if (pnl.pnlPct <= -15) reason = "CUT LOSS";
         else if (trail > 0 && pnl.pnlPct <= (pos.peakPnlPct - trail)) reason = "TRAILING";
         if (reason) {
           const sig = await sellAll(mint);
@@ -257,21 +255,47 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
   try {
     if (!hardMode.active) return;
     if (!logs.some(l => l.includes("Instruction: Create"))) return;
+
+    const rawBal = await getRawBalance();
+    if (rawBal < GAS_RESERVE + 0.005) {
+      console.log(`skip ${signature.slice(0, 8)}: saldo ${rawBal.toFixed(4)} SOL < minimum`);
+      return;
+    }
+
     const holdings = await getTokenHoldings();
     const maxC = currentMaxCoins();
     if (holdings.length >= maxC) return;
+
     const safeBalance = await getSafeBalance();
     if (safeBalance <= (hardMode.initialBalance * hardMode.maxLossLimit)) {
       hardMode.active = false;
       if (CHAT_ID) await bot.telegram.sendMessage(CHAT_ID, `🚨 *CIRCUIT BREAKER* 🚨\nSaldo turun 50%! Bot mati.`, { parse_mode: "Markdown" });
       return;
     }
+
     const buyAmount = safeBalance / maxC;
     if (buyAmount < 0.003) return;
-    const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 1, commitment: "confirmed" });
-    const mint = (tx?.meta?.postTokenBalances || [])[0]?.mint;
-    if (!mint) return;
-    const res = await analyze({ mint, devWallet: tx.transaction.message.accountKeys[0]?.toString() });
+
+    let tx = null;
+    for (let i = 0; i < 5; i++) {
+      tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 1, commitment: "confirmed" });
+      if (tx) break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    if (!tx || !tx.transaction || !tx.transaction.message) {
+      console.log(`skip ${signature.slice(0, 8)}: tx belum tersedia`);
+      return;
+    }
+
+    const postBalances = tx.meta?.postTokenBalances || [];
+    const mint = postBalances[0]?.mint;
+    if (!mint) { console.log(`skip ${signature.slice(0, 8)}: no mint`); return; }
+
+    const accountKeys = tx.transaction.message.accountKeys || [];
+    const devWallet = accountKeys[0]?.toString() || "";
+    if (!devWallet) { console.log(`skip ${signature.slice(0, 8)}: no dev`); return; }
+
+    const res = await analyze({ mint, devWallet });
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await buy(mint, buyAmount);
       const price = await getCurrentPrice(mint);
@@ -281,7 +305,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
         `🔥 *BUY* \`${mint.slice(0, 8)}\` | ${buyAmount.toFixed(4)} SOL | skor ${res.score} (${res.reason})\ntx: \`${sig}\``,
         { parse_mode: "Markdown" });
     }
-  } catch (e) { console.error("onLogs error:", e.message); }
+  } catch (e) { console.error("onLogs error:", e.stack || e.message); }
 }, "confirmed");
 
 // ============ BOT UI ============
@@ -326,7 +350,7 @@ bot.action("hard_toggle", async ctx => {
   try {
     if (!hardMode.active) {
       const bal = await getSafeBalance();
-      if (bal < 0.01) return ctx.answerCbQuery("❌ Saldo aman < 0.01 SOL!", { show_alert: true });
+      if (bal < 0.01) return ctx.answerCbQuery("❌ Saldo aman < 0.01 SOL. Isi dulu wallet bot!", { show_alert: true });
       hardMode.initialBalance = bal;
       hardMode.active = true;
       await ctx.answerCbQuery("Hard Mode ON!");
@@ -399,11 +423,52 @@ bot.action("wallet", async ctx => {
   } catch (e) { try { await ctx.answerCbQuery("❌ " + e.message, { show_alert: true }); } catch {} }
 });
 
+// ============ LAPORAN TIAP 10 MENIT ============
+async function reportLoop() {
+  while (true) {
+    await new Promise(r => setTimeout(r, REPORT_MINUTES * 60 * 1000));
+    if (!CHAT_ID) continue;
+    try {
+      const rawBal = await getRawBalance();
+      const safeBal = await getSafeBalance();
+      const holdings = await getTokenHoldings();
+
+      let totalPnlSol = 0;
+      let posLines = "";
+      for (const h of holdings) {
+        const pnl = await getPnl(h.mint);
+        if (pnl) {
+          totalPnlSol += pnl.pnlSol;
+          const sign = pnl.pnlPct >= 0 ? "+" : "";
+          posLines += `  • \`${h.mint.slice(0, 6)}\` ${sign}${pnl.pnlPct}% (${sign}${pnl.pnlSol} SOL)\n`;
+        } else {
+          posLines += `  • \`${h.mint.slice(0, 6)}\` —\n`;
+        }
+      }
+
+      const status = hardMode.active ? "🟢 ON" : "🔴 OFF";
+      const pnlSign = totalPnlSol >= 0 ? "+" : "";
+      const text =
+        `📊 *LAPORAN ${REPORT_MINUTES} MENIT*\n\n` +
+        `Status: ${status}\n` +
+        `Saldo: *${rawBal.toFixed(4)} SOL* (safe: ${safeBal.toFixed(4)})\n` +
+        `Posisi: ${holdings.length}/${currentMaxCoins()}\n` +
+        `PnL terbuka: ${pnlSign}${totalPnlSol.toFixed(4)} SOL\n\n` +
+        (posLines ? `*Detail:*\n${posLines}` : `_Tidak ada posisi terbuka._`);
+
+      await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: "Markdown" });
+    } catch (e) {
+      console.error("reportLoop error:", e.message);
+    }
+  }
+}
+
 // ============ GUARDS ============
 process.on("unhandledRejection", r => console.error("⚠️ Unhandled:", r?.message || r));
 process.on("uncaughtException", e => console.error("⚠️ Uncaught:", e?.message || e));
 
 hardModeLoop().catch(e => console.error("loop crashed:", e.message));
+reportLoop().catch(e => console.error("report crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — AUTO-TUNED 📈");
+console.log("📈 LANOX BOT RUNNING — FULL AUTO-TUNED 📈");

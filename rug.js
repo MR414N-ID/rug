@@ -32,12 +32,14 @@ const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.12");
 const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "8000");
 const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "8");
 const MAX_LIQ_SOL       = parseFloat(process.env.MAX_LIQ_SOL || "500");
+const MAX_AGE_HOURS     = parseFloat(process.env.MAX_AGE_HOURS || "6");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
 const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
 const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "800");
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
@@ -60,6 +62,11 @@ function fmtPnl(sol) {
   const sign = sol >= 0 ? "+" : "-";
   return `${sign}${Math.abs(sol).toFixed(4)} SOL (~${sign}${fmtIdr(Math.abs(sol))})`;
 }
+function fmtAge(hours) {
+  if (hours == null) return "?";
+  if (hours < 1) return `${Math.round(hours * 60)}m`;
+  return `${hours.toFixed(1)}j`;
+}
 
 // ============ RPC HELPERS ============
 let isRpcBusy = false;
@@ -73,7 +80,13 @@ async function rpc(method, params) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
     });
-    const json = await res.json();
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch {
+      rpcDelay = Math.min(rpcDelay * 2, 10000);
+      await new Promise(r => setTimeout(r, rpcDelay));
+      return null;
+    }
     if (json.error && json.error.code === 429) {
       rpcDelay = Math.min(rpcDelay * 2, 10000);
       await new Promise(r => setTimeout(r, rpcDelay));
@@ -108,6 +121,14 @@ async function getSafeBalance() {
   const raw = await getRawBalance();
   const usable = raw - GAS_RESERVE;
   return usable > 0 ? usable : 0;
+}
+
+// ============ MINT PROGRAM DETECTION ============
+async function isToken2022(mintStr) {
+  try {
+    const info = await connection.getParsedAccountInfo(new PublicKey(mintStr));
+    return info.value?.owner?.equals(TOKEN_2022_PROGRAM_ID) || false;
+  } catch { return false; }
 }
 
 // ============ PDAs & BONDING CURVE ============
@@ -175,6 +196,46 @@ async function getCurrentPrice(mintStr) {
   } catch { return 0; }
 }
 
+// ============ ON-CHAIN AGE + ACTIVITY (ganti DexScreener) ============
+async function getTokenActivity(mintStr) {
+  // umur: signature tertua di mint account
+  // aktivitas: jumlah tx di bonding curve dalam 5 menit terakhir
+  try {
+    const mint = new PublicKey(mintStr);
+    const pda = getBondingCurvePDA(mintStr);
+    const now = Date.now() / 1000;
+
+    // umur dari mint signatures
+    let ageHours = null;
+    try {
+      const mintSigs = await connection.getSignaturesForAddress(mint, { limit: 1000 });
+      if (mintSigs.length) {
+        const oldest = mintSigs[mintSigs.length - 1];
+        if (oldest.blockTime) {
+          ageHours = Math.max(0, (now - oldest.blockTime) / 3600);
+        }
+      }
+    } catch {}
+
+    // aktivitas dari bonding curve signatures
+    let txCount5m = 0;
+    let txCount30m = 0;
+    try {
+      const bcSigs = await connection.getSignaturesForAddress(pda, { limit: 200 });
+      for (const s of bcSigs) {
+        if (!s.blockTime) continue;
+        const age = now - s.blockTime;
+        if (age <= 300) txCount5m++;
+        if (age <= 1800) txCount30m++;
+      }
+    } catch {}
+
+    return { ageHours, txCount5m, txCount30m };
+  } catch {
+    return { ageHours: null, txCount5m: 0, txCount30m: 0 };
+  }
+}
+
 // ============ FEE RECIPIENT ============
 let cachedFeeRecipient = null;
 async function getFeeRecipient() {
@@ -191,7 +252,7 @@ async function getFeeRecipient() {
   return cachedFeeRecipient;
 }
 
-// ============ MANUAL BUY / SELL INSTRUCTIONS ============
+// ============ MANUAL BUY / SELL ============
 const BUY_DISC  = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
 const SELL_DISC = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
 
@@ -203,8 +264,8 @@ async function buildBuyIx(mintStr, solAmount) {
 
   const feeRecipient = await getFeeRecipient();
   const creatorVault = getCreatorVaultPDA(state.creator);
-  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true);
-  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
+  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, TOKEN_PROGRAM_ID);
+  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
 
   const solLamports = BigInt(Math.floor(solAmount * 1e9));
   const solAfterFee = solLamports * 99n / 100n;
@@ -248,8 +309,8 @@ async function buildSellIx(mintStr, tokenAmount) {
 
   const feeRecipient = await getFeeRecipient();
   const creatorVault = getCreatorVaultPDA(state.creator);
-  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true);
-  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
+  const associatedBondingCurve = await getAssociatedTokenAddress(mint, state.pda, true, TOKEN_PROGRAM_ID);
+  const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
 
   const solOut = (tokenAmount * state.virtualSolReserves) / (state.virtualTokenReserves + tokenAmount);
   const solOutAfterFee = solOut * 99n / 100n;
@@ -341,7 +402,7 @@ async function buyWithRetry(mintStr, solAmount) {
 
 async function sellAll(mintStr) {
   const mint = new PublicKey(mintStr);
-  const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+  const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
   let info;
   try {
     info = await connection.getTokenAccountBalance(ata);
@@ -378,7 +439,7 @@ async function getTokenHoldings() {
   return holdings;
 }
 
-// ============ ANALYZER ============
+// ============ ANALYZER (full on-chain, tanpa DexScreener) ============
 async function getHolderConcentration(mint, supply) {
   const holders = await getLargestHolders(mint);
   if (!holders.length || supply <= 0) return { top10: 100, top20: 100, count: 0 };
@@ -386,22 +447,6 @@ async function getHolderConcentration(mint, supply) {
   const top10 = amounts.slice(0, 10).reduce((a, b) => a + b, 0) / supply * 100;
   const top20 = amounts.slice(0, 20).reduce((a, b) => a + b, 0) / supply * 100;
   return { top10: +top10.toFixed(1), top20: +top20.toFixed(1), count: holders.length };
-}
-
-async function getVolumeData(mint) {
-  try {
-    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    const data = await res.json();
-    if (!data.pairs || !data.pairs.length) return { vol5m: 0, vol1h: 0, buys5m: 0, sells5m: 0, priceChange5m: 0 };
-    const p = data.pairs[0];
-    return {
-      vol5m: parseFloat(p.volume?.m5 || "0"),
-      vol1h: parseFloat(p.volume?.h1 || "0"),
-      buys5m: parseInt(p.txns?.m5?.buys || "0"),
-      sells5m: parseInt(p.txns?.m5?.sells || "0"),
-      priceChange5m: parseFloat(p.priceChange?.m5 || "0"),
-    };
-  } catch { return { vol5m: 0, vol1h: 0, buys5m: 0, sells5m: 0, priceChange5m: 0 }; }
 }
 
 async function getMintAuthority(mint) {
@@ -419,68 +464,80 @@ async function getFreezeAuthority(mint) {
 
 async function analyze({ mint }) {
   try {
+    if (await isToken2022(mint)) return { score: 0, reason: `token-2022 skip` };
+
     const supply = await getTokenSupply(mint);
-    const [concentration, liqSol, volume, mintAuth, freezeAuth, state] = await Promise.all([
+    const [concentration, state, activity, mintAuth, freezeAuth] = await Promise.all([
       getHolderConcentration(mint, supply),
-      getLiquidity(mint),
-      getVolumeData(mint),
+      getBondingCurveState(mint),
+      getTokenActivity(mint),
       getMintAuthority(mint),
       getFreezeAuthority(mint),
-      getBondingCurveState(mint),
     ]);
 
     if (!state) return { score: 0, reason: `no bonding curve` };
     if (state.complete) return { score: 0, reason: `graduated` };
+
+    const liqSol = Number(state.virtualSolReserves) / 1e9;
+    const raisedSol = Number(state.realSolReserves) / 1e9;
+
     if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq ${liqSol.toFixed(1)} < ${MIN_LIQ_SOL}` };
     if (liqSol > MAX_LIQ_SOL) return { score: 0, reason: `graduated (liq ${liqSol.toFixed(0)} > ${MAX_LIQ_SOL})` };
     if (freezeAuth) return { score: 0, reason: `freeze authority aktif` };
     if (concentration.top10 > 90) return { score: 0, reason: `top10 ${concentration.top10}% > 90%` };
 
+    if (activity.ageHours != null && activity.ageHours > MAX_AGE_HOURS) {
+      return { score: 0, reason: `umur ${fmtAge(activity.ageHours)} > ${MAX_AGE_HOURS}j` };
+    }
+
     const scores = {};
 
+    // 1. holder concentration (20%)
     if (concentration.top10 < 30) scores.holders = 100;
     else if (concentration.top10 < 45) scores.holders = 80;
     else if (concentration.top10 < 60) scores.holders = 50;
     else scores.holders = 20;
 
+    // 2. likuiditas (15%)
     if (liqSol > 80) scores.liquidity = 100;
     else if (liqSol > 50) scores.liquidity = 80;
     else if (liqSol > 30) scores.liquidity = 60;
     else scores.liquidity = 40;
 
-    let volScore = 0;
-    if (volume.vol5m > 2000) volScore = 100;
-    else if (volume.vol5m > 500) volScore = 80;
-    else if (volume.vol5m > 100) volScore = 50;
+    // 3. aktivitas 5 menit dari bonding curve signatures (25%)
+    if (activity.txCount5m > 50) scores.activity = 100;
+    else if (activity.txCount5m > 20) scores.activity = 80;
+    else if (activity.txCount5m > 5) scores.activity = 50;
+    else if (activity.txCount5m > 0) scores.activity = 30;
+    else scores.activity = 0;
 
-    let momentumScore = 0;
-    if (volume.buys5m + volume.sells5m > 0) {
-      const buyRatio = volume.buys5m / (volume.buys5m + volume.sells5m);
-      if (buyRatio > 0.65) momentumScore = 100;
-      else if (buyRatio > 0.55) momentumScore = 70;
-      else if (buyRatio > 0.45) momentumScore = 40;
-    }
-    if (volume.priceChange5m > 5 && volume.priceChange5m < 50) momentumScore = Math.min(100, momentumScore + 20);
-    else if (volume.priceChange5m >= 100) momentumScore = Math.max(0, momentumScore - 30);
+    // 4. SOL raised (proxy minat beli) (15%)
+    if (raisedSol > 60) scores.raised = 100;
+    else if (raisedSol > 30) scores.raised = 80;
+    else if (raisedSol > 10) scores.raised = 60;
+    else if (raisedSol > 3) scores.raised = 40;
+    else scores.raised = 20;
 
-    scores.volume = Math.round((volScore * 0.6) + (momentumScore * 0.4));
+    // 5. mint authority (10%)
     scores.authority = mintAuth ? 50 : 100;
 
+    // 6. holder count (15%)
     if (concentration.count > 60) scores.holders_count = 100;
     else if (concentration.count > 30) scores.holders_count = 80;
     else if (concentration.count > 10) scores.holders_count = 50;
     else scores.holders_count = 20;
 
     const total =
-      scores.holders * 0.25 +
-      scores.liquidity * 0.20 +
-      scores.volume * 0.25 +
-      scores.authority * 0.15 +
+      scores.holders * 0.20 +
+      scores.liquidity * 0.15 +
+      scores.activity * 0.25 +
+      scores.raised * 0.15 +
+      scores.authority * 0.10 +
       scores.holders_count * 0.15;
 
     return {
       score: +total.toFixed(1),
-      reason: `top10 ${concentration.top10}% liq ${liqSol.toFixed(0)} vol5m $${volume.vol5m.toFixed(0)} buy ${volume.buys5m}/${volume.sells5m} auth ${mintAuth ? "ada" : "revoked"}`,
+      reason: `age ${fmtAge(activity.ageHours)} tx5m ${activity.txCount5m} raised ${raisedSol.toFixed(1)}S top10 ${concentration.top10}% liq ${liqSol.toFixed(0)} auth ${mintAuth ? "ada" : "revoked"}`,
     };
   } catch (e) {
     return { score: 0, reason: `analyze error: ${e.message}` };
@@ -645,6 +702,8 @@ function welcomeText() {
   return (
     "📈 *LANOX TRADING MEME COIN* 📈\n\n" +
     `💱 Rate: 1 SOL ≈ *Rp ${rate.toLocaleString('id-ID')}*\n` +
+    `⏱️ Filter umur: max *${MAX_AGE_HOURS} jam*\n` +
+    "🔍 Data: *full on-chain*\n" +
     "🤖 Status: *Siap Beraksi*\n" +
     "💰 Mode: Hard Mode Compounding\n" +
     "⚡ Jaringan: Solana (Pump.fun)\n\n" +
@@ -671,6 +730,7 @@ async function hardMenuText() {
     `Status: ${status}\n` +
     `Max Koin: ${currentMaxCoins()}\n` +
     `Score Min: ${SCORE_THRESHOLD}\n` +
+    `Umur Max: ${MAX_AGE_HOURS} jam\n` +
     `Slippage: ${(SLIPPAGE_BUY*100).toFixed(0)}%/${(SLIPPAGE_SELL*100).toFixed(0)}%\n` +
     `Circuit: -50%\n\n` +
     `Saldo: *${bal.toFixed(4)} SOL*\n` +
@@ -828,4 +888,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — MANUAL PDA + IDR AUTO 📈");
+console.log("📈 LANOX BOT RUNNING — FULL ON-CHAIN + IDR 📈");

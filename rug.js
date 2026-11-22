@@ -26,7 +26,7 @@ const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 
-const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "50");
+const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "35");
 const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");
 const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");
 const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.10");
@@ -34,10 +34,10 @@ const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.12");
 const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "50000");
 const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "8");
 const MAX_LIQ_SOL       = parseFloat(process.env.MAX_LIQ_SOL || "500");
-const MAX_AGE_HOURS     = parseFloat(process.env.MAX_AGE_HOURS || "6");
+const MAX_AGE_HOURS     = parseFloat(process.env.MAX_AGE_HOURS || "20");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
 const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
-const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "800");
+const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "1500"); // Diperlambat dikit biar ga spam
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -200,7 +200,7 @@ async function executeBuy(mintStr, solAmount) {
     mint,
     user: wallet.publicKey,
     solAmount: BigInt(lamports),
-    amount: BigInt(0), // SDK hitung otomatis
+    amount: BigInt(0),
     slippage: SLIPPAGE_BUY,
   });
 
@@ -404,11 +404,9 @@ let lastAnalyzeTime = 0;
 
 connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) => {
   try {
-    // TES PAKSA: Print titik setiap ada log masuk
-    process.stdout.write(".");
-
     if (!hardMode.active) return;
-    if (!logs.some(l => l.includes("Instruction: Create"))) return;
+    
+    // FILTER DIBUANG: Langsung tembak semua log yang masuk
     if (seenSignatures.has(signature)) return;
     seenSignatures.add(signature);
     if (seenSignatures.size > 2000) seenSignatures.clear();
@@ -454,8 +452,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
 
     const res = await analyze({ mint });
     
-    // LOG DIBUKA TOTAL (Cerewet)
-    console.log(`\nanalyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
+    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
 
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await executeBuy(mint, buyAmount);
@@ -466,7 +463,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
         `🔥 *BUY (SDK)* \`${mint.slice(0, 8)}\`\nAmount: *${buyAmount.toFixed(4)} SOL (~${fmtIdr(buyAmount)})*\nSkor: ${res.score}\n${res.reason}\ntx: \`${sig}\``,
         { parse_mode: "Markdown" });
     }
-  } catch (e) { console.error("\nonLogs error:", e.message); }
+  } catch (e) { console.error("onLogs error:", e.message); }
 }, "confirmed");
 
 // ============ BOT UI ============
@@ -645,4 +642,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — FULL SDK ENGINE + TES TITIK 📈");
+console.log("📈 LANOX BOT RUNNING — TANPA FILTER TEKS (FULL SDK) 📈");

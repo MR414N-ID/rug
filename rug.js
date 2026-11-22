@@ -450,9 +450,9 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     if (!mint) return;
 
     const res = await analyze({ mint });
-    if (res.score > 0 || res.reason.startsWith("age")) {
-      console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
-    }
+    
+    // LOG DIBUKA TOTAL (Cerewet)
+    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
 
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await executeBuy(mint, buyAmount);
@@ -642,4 +642,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — FULL SDK ENGINE + IDR 📈");
+console.log("📈 LANOX BOT RUNNING — FULL SDK ENGINE + IDR (CEREBET LOG) 📈");

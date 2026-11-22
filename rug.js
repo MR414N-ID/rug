@@ -26,13 +26,13 @@ const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 
-const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "35");
+const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "0"); // Set 0 buat tes
 const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");
 const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");
 const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.10");
 const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.12");
 const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "50000");
-const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "8");
+const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "5"); // Diturunin dikit
 const MAX_LIQ_SOL       = parseFloat(process.env.MAX_LIQ_SOL || "500");
 const MAX_AGE_HOURS     = parseFloat(process.env.MAX_AGE_HOURS || "20");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
@@ -630,3 +630,6 @@ rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
 console.log("📈 LANOX BOT RUNNING — FULL SDK ENGINE + ANTI-429 📈");
+
+// Print saldo awal biar kita tau walletnya konek
+getRawBalance().then(b => console.log(`💰 Saldo Wallet Bot: ${b.toFixed(4)} SOL`));

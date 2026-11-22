@@ -37,7 +37,7 @@ const MAX_LIQ_SOL       = parseFloat(process.env.MAX_LIQ_SOL || "500");
 const MAX_AGE_HOURS     = parseFloat(process.env.MAX_AGE_HOURS || "20");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
 const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
-const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "1500"); // Diperlambat dikit biar ga spam
+const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "1000");
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -125,15 +125,6 @@ async function getSafeBalance() {
 }
 
 // ============ BONDING CURVE STATE ============
-async function getBondingCurvePDA(mintStr) {
-  const mint = new PublicKey(mintStr);
-  const [pda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("bonding-curve"), mint.toBuffer()],
-    PUMP_PROGRAM
-  );
-  return pda;
-}
-
 async function getBondingCurveState(mintStr) {
   try {
     const state = await sdk.fetchBuyState(new PublicKey(mintStr), wallet.publicKey);
@@ -148,12 +139,6 @@ async function getBondingCurveState(mintStr) {
   } catch { return null; }
 }
 
-async function getLiquidity(mint) {
-  const st = await getBondingCurveState(mint);
-  if (!st) return 0;
-  return Number(st.virtualSolReserves) / 1e9;
-}
-
 async function getCurrentPrice(mintStr) {
   const st = await getBondingCurveState(mintStr);
   if (!st || st.virtualTokenReserves === 0n) return 0;
@@ -164,7 +149,7 @@ async function getCurrentPrice(mintStr) {
 async function getTokenActivity(mintStr) {
   try {
     const mint = new PublicKey(mintStr);
-    const pda = await getBondingCurvePDA(mintStr);
+    const [pda] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.toBuffer()], PUMP_PROGRAM);
     const now = Date.now() / 1000;
 
     let ageHours = null;
@@ -396,7 +381,7 @@ async function hardModeLoop() {
   }
 }
 
-// ============ AUTO MONITOR ============
+// ============ AUTO MONITOR (ANTI 429) ============
 const seenSignatures = new Set();
 const processedMints = new Map();
 const MINT_COOLDOWN = 5 * 60 * 1000;
@@ -406,7 +391,9 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
   try {
     if (!hardMode.active) return;
     
-    // FILTER DIBUANG: Langsung tembak semua log yang masuk
+    // REM ANTI 429 (PENTING BANGET)
+    if (!logs.some(l => l.includes("Instruction: Create"))) return;
+    
     if (seenSignatures.has(signature)) return;
     seenSignatures.add(signature);
     if (seenSignatures.size > 2000) seenSignatures.clear();
@@ -642,4 +629,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — TANPA FILTER TEKS (FULL SDK) 📈");
+console.log("📈 LANOX BOT RUNNING — FULL SDK ENGINE + ANTI-429 📈");

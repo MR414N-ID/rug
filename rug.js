@@ -6,6 +6,11 @@ import {
   TransactionMessage, SystemProgram, LAMPORTS_PER_SOL,
   ComputeBudgetProgram,
 } from "@solana/web3.js";
+import {
+  getAssociatedTokenAddress, TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountIdempotentInstruction,
+} from "@solana/spl-token";
 import { PumpSdk } from "@pump-fun/pump-sdk";
 import { Telegraf, Markup } from "telegraf";
 import bs58 from "bs58";
@@ -21,25 +26,26 @@ const CHAT_ID         = process.env.CHAT_ID || "";
 const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const POSITIONS_FILE  = "./positions.json";
 
-const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "10");
+const SCORE_THRESHOLD   = parseInt(process.env.SCORE_THRESHOLD || "50");
 const MAX_COINS_CFG     = parseInt(process.env.MAX_COINS || "2");
 const GAS_RESERVE       = parseFloat(process.env.GAS_RESERVE || "0.008");
 const SLIPPAGE_BUY      = parseFloat(process.env.SLIPPAGE_BUY || "0.10");
-const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.10");
-const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "8000");
-const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "5");
+const SLIPPAGE_SELL     = parseFloat(process.env.SLIPPAGE_SELL || "0.12");
+const PRIORITY_FEE      = parseInt(process.env.PRIORITY_FEE || "50000");
+const MIN_LIQ_SOL       = parseFloat(process.env.MIN_LIQ_SOL || "8");
 const MAX_LIQ_SOL       = parseFloat(process.env.MAX_LIQ_SOL || "500");
-const MAX_AGE_HOURS     = parseFloat(process.env.MAX_AGE_HOURS || "20");
+const MAX_AGE_HOURS     = parseFloat(process.env.MAX_AGE_HOURS || "6");
 const REPORT_MINUTES    = parseInt(process.env.REPORT_MINUTES || "10");
-const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "2000");
-const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "3500");
+const RPC_DELAY_MS      = parseInt(process.env.RPC_DELAY_MS || "1500");
+const ANALYZE_COOLDOWN  = parseInt(process.env.ANALYZE_COOLDOWN_MS || "800");
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 const WELCOME_IMG = "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop";
 
-// ============ CURRENCY ============
+// ============ CURRENCY (IDR) ============
 const priceCache = { solUsd: 140, usdIdr: 16000, lastUpdate: 0 };
 async function updatePrices() {
   try {
@@ -58,8 +64,13 @@ function fmtPnl(sol) {
   const sign = sol >= 0 ? "+" : "-";
   return `${sign}${Math.abs(sol).toFixed(4)} SOL (~${sign}${fmtIdr(Math.abs(sol))})`;
 }
+function fmtAge(hours) {
+  if (hours == null) return "?";
+  if (hours < 1) return `${Math.round(hours * 60)}m`;
+  return `${hours.toFixed(1)}j`;
+}
 
-// ============ RPC HELPERS ============
+// ============ RPC HELPERS (Anti 429) ============
 let isRpcBusy = false;
 let rpcDelay = RPC_DELAY_MS;
 async function rpc(method, params) {
@@ -113,6 +124,16 @@ async function getSafeBalance() {
   return usable > 0 ? usable : 0;
 }
 
+// ============ BONDING CURVE STATE ============
+async function getBondingCurvePDA(mintStr) {
+  const mint = new PublicKey(mintStr);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("bonding-curve"), mint.toBuffer()],
+    PUMP_PROGRAM
+  );
+  return pda;
+}
+
 async function getBondingCurveState(mintStr) {
   try {
     const state = await sdk.fetchBuyState(new PublicKey(mintStr), wallet.publicKey);
@@ -120,9 +141,17 @@ async function getBondingCurveState(mintStr) {
       pda: state.bondingCurveAccountInfo.pubkey,
       virtualTokenReserves: state.bondingCurve.virtualTokenReserves,
       virtualSolReserves:   state.bondingCurve.virtualSolReserves,
+      realSolReserves:      state.bondingCurve.realSolReserves,
       complete:             state.bondingCurve.complete,
+      creator:              state.bondingCurve.creator,
     };
   } catch { return null; }
+}
+
+async function getLiquidity(mint) {
+  const st = await getBondingCurveState(mint);
+  if (!st) return 0;
+  return Number(st.virtualSolReserves) / 1e9;
 }
 
 async function getCurrentPrice(mintStr) {
@@ -131,6 +160,34 @@ async function getCurrentPrice(mintStr) {
   return Number(st.virtualSolReserves) / Number(st.virtualTokenReserves);
 }
 
+// ============ ON-CHAIN AGE & ACTIVITY ============
+async function getTokenActivity(mintStr) {
+  try {
+    const mint = new PublicKey(mintStr);
+    const pda = await getBondingCurvePDA(mintStr);
+    const now = Date.now() / 1000;
+
+    let ageHours = null;
+    try {
+      const mintSigs = await connection.getSignaturesForAddress(mint, { limit: 1000 });
+      if (mintSigs.length) {
+        const oldest = mintSigs[mintSigs.length - 1];
+        if (oldest.blockTime) ageHours = Math.max(0, (now - oldest.blockTime) / 3600);
+      }
+    } catch {}
+
+    let txCount5m = 0;
+    try {
+      const bcSigs = await connection.getSignaturesForAddress(pda, { limit: 200 });
+      for (const s of bcSigs) {
+        if (s.blockTime && (now - s.blockTime) <= 300) txCount5m++;
+      }
+    } catch {}
+    return { ageHours, txCount5m };
+  } catch { return { ageHours: null, txCount5m: 0 }; }
+}
+
+// ============ EXECUTE BUY & SELL (VIA SDK) ============
 async function executeBuy(mintStr, solAmount) {
   const mint = new PublicKey(mintStr);
   const lamports = Math.floor(solAmount * 1e9);
@@ -163,7 +220,8 @@ async function executeBuy(mintStr, solAmount) {
 
 async function executeSell(mintStr) {
   const mint = new PublicKey(mintStr);
-  const info = await connection.getTokenAccountBalance(await getAssociatedTokenAddress(mint, wallet.publicKey)).catch(() => null);
+  const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+  const info = await connection.getTokenAccountBalance(ata).catch(() => null);
   if (!info || info.value.amount === "0") throw new Error("no balance");
 
   const rawAmount = BigInt(info.value.amount);
@@ -195,12 +253,94 @@ async function executeSell(mintStr) {
 
 async function getTokenHoldings() {
   const holdings = [];
-  const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") });
+  const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { programId: TOKEN_PROGRAM_ID });
   for (const acc of accounts.value) {
     const info = acc.account.data.parsed.info;
     if (info.tokenAmount.uiAmount > 0) holdings.push({ mint: info.mint, amount: info.tokenAmount.uiAmount });
   }
   return holdings;
+}
+
+// ============ ANALYZER ============
+async function getHolderConcentration(mint, supply) {
+  const holders = await getLargestHolders(mint);
+  if (!holders.length || supply <= 0) return { top10: 100, count: 0 };
+  const amounts = holders.map(h => parseInt(h.amount)).sort((a, b) => b - a);
+  const top10 = amounts.slice(0, 10).reduce((a, b) => a + b, 0) / supply * 100;
+  return { top10: +top10.toFixed(1), count: holders.length };
+}
+
+async function getMintAuthority(mint) {
+  const info = await connection.getParsedAccountInfo(new PublicKey(mint)).catch(()=>null);
+  return info?.value?.data?.parsed?.info?.mintAuthority || null;
+}
+async function getFreezeAuthority(mint) {
+  const info = await connection.getParsedAccountInfo(new PublicKey(mint)).catch(()=>null);
+  return info?.value?.data?.parsed?.info?.freezeAuthority || null;
+}
+
+async function analyze({ mint }) {
+  try {
+    const supply = await getTokenSupply(mint);
+    const [concentration, state, activity, mintAuth, freezeAuth] = await Promise.all([
+      getHolderConcentration(mint, supply),
+      getBondingCurveState(mint),
+      getTokenActivity(mint),
+      getMintAuthority(mint),
+      getFreezeAuthority(mint),
+    ]);
+
+    if (!state) return { score: 0, reason: `no curve` };
+    if (state.complete) return { score: 0, reason: `graduated` };
+
+    const liqSol = Number(state.virtualSolReserves) / 1e9;
+    const raisedSol = Number(state.realSolReserves) / 1e9;
+
+    if (liqSol < MIN_LIQ_SOL) return { score: 0, reason: `liq < ${MIN_LIQ_SOL}` };
+    if (liqSol > MAX_LIQ_SOL) return { score: 0, reason: `graduated (liq > ${MAX_LIQ_SOL})` };
+    if (freezeAuth) return { score: 0, reason: `freeze auth` };
+    if (concentration.top10 > 90) return { score: 0, reason: `top10 > 90%` };
+    if (activity.ageHours != null && activity.ageHours > MAX_AGE_HOURS) return { score: 0, reason: `umur > ${MAX_AGE_HOURS}j` };
+
+    const scores = {};
+    if (concentration.top10 < 30) scores.holders = 100;
+    else if (concentration.top10 < 45) scores.holders = 80;
+    else if (concentration.top10 < 60) scores.holders = 50;
+    else scores.holders = 20;
+
+    if (liqSol > 80) scores.liquidity = 100;
+    else if (liqSol > 50) scores.liquidity = 80;
+    else if (liqSol > 30) scores.liquidity = 60;
+    else scores.liquidity = 40;
+
+    if (activity.txCount5m > 50) scores.activity = 100;
+    else if (activity.txCount5m > 20) scores.activity = 80;
+    else if (activity.txCount5m > 5) scores.activity = 50;
+    else if (activity.txCount5m > 0) scores.activity = 30;
+    else scores.activity = 0;
+
+    if (raisedSol > 60) scores.raised = 100;
+    else if (raisedSol > 30) scores.raised = 80;
+    else if (raisedSol > 10) scores.raised = 60;
+    else if (raisedSol > 3) scores.raised = 40;
+    else scores.raised = 20;
+
+    scores.authority = mintAuth ? 50 : 100;
+
+    if (concentration.count > 60) scores.holders_count = 100;
+    else if (concentration.count > 30) scores.holders_count = 80;
+    else if (concentration.count > 10) scores.holders_count = 50;
+    else scores.holders_count = 20;
+
+    const total =
+      scores.holders * 0.20 + scores.liquidity * 0.15 + scores.activity * 0.25 +
+      scores.raised * 0.15 + scores.authority * 0.10 + scores.holders_count * 0.15;
+
+    return {
+      score: +total.toFixed(1),
+      reason: `age ${fmtAge(activity.ageHours)} tx5m ${activity.txCount5m} raised ${raisedSol.toFixed(1)}S top10 ${concentration.top10}%`,
+    };
+  } catch (e) { return { score: 0, reason: e.message }; }
 }
 
 // ============ STATE & TP/SL ============
@@ -256,15 +396,19 @@ async function hardModeLoop() {
   }
 }
 
-// ============ MONITOR & BUY ============
+// ============ AUTO MONITOR (ANTI 429) ============
 const seenSignatures = new Set();
 const processedMints = new Map();
 const MINT_COOLDOWN = 5 * 60 * 1000;
 let lastAnalyzeTime = 0;
 
-connection.onLogs(PUMP_PROGRAM, async ({ logs, signature }) => {
+connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) => {
   try {
     if (!hardMode.active) return;
+    
+    // REM ANTI 429 (PENTING BANGET)
+    if (!logs.some(l => l.includes("Instruction: Create"))) return;
+    
     if (seenSignatures.has(signature)) return;
     seenSignatures.add(signature);
     if (seenSignatures.size > 2000) seenSignatures.clear();
@@ -277,8 +421,8 @@ connection.onLogs(PUMP_PROGRAM, async ({ logs, signature }) => {
     if (rawBal < GAS_RESERVE + 0.005) return;
     const holdings = await getTokenHoldings();
     if (holdings.length >= currentMaxCoins()) return;
-    
     const safeBalance = await getSafeBalance();
+    
     if (safeBalance <= (hardMode.initialBalance * hardMode.maxLossLimit)) {
       hardMode.active = false;
       if (CHAT_ID) await bot.telegram.sendMessage(CHAT_ID, `🚨 *CIRCUIT BREAKER* 🚨\nSaldo turun 50%!`, { parse_mode: "Markdown" });
@@ -308,17 +452,19 @@ connection.onLogs(PUMP_PROGRAM, async ({ logs, signature }) => {
     }
     if (!mint) return;
 
-    console.log(`\n✅ DAPET TOKEN PUMP.FUN! Mint: ${mint.slice(0,8)}`);
+    const res = await analyze({ mint });
     
-    const sig = await executeBuy(mint, buyAmount);
-    const price = await getCurrentPrice(mint);
-    POSITIONS[mint] = { entrySol: buyAmount, entryPrice: price, tokenAmount: buyAmount / price, peakPnlPct: 0, tx: sig };
-    savePositions();
-    
-    if (CHAT_ID) await bot.telegram.sendMessage(CHAT_ID,
-      `🔥 *BUY (SDK)* \`${mint.slice(0, 8)}\`\nAmount: *${buyAmount.toFixed(4)} SOL (~${fmtIdr(buyAmount)})*\ntx: \`${sig}\``,
-      { parse_mode: "Markdown" });
-      
+    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
+
+    if (res.score >= SCORE_THRESHOLD) {
+      const sig = await executeBuy(mint, buyAmount);
+      const price = await getCurrentPrice(mint);
+      POSITIONS[mint] = { entrySol: buyAmount, entryPrice: price, tokenAmount: buyAmount / price, peakPnlPct: 0, tx: sig };
+      savePositions();
+      if (CHAT_ID) await bot.telegram.sendMessage(CHAT_ID,
+        `🔥 *BUY (SDK)* \`${mint.slice(0, 8)}\`\nAmount: *${buyAmount.toFixed(4)} SOL (~${fmtIdr(buyAmount)})*\nSkor: ${res.score}\n${res.reason}\ntx: \`${sig}\``,
+        { parse_mode: "Markdown" });
+    }
   } catch (e) { console.error("onLogs error:", e.message); }
 }, "confirmed");
 

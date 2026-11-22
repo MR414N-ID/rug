@@ -404,6 +404,9 @@ let lastAnalyzeTime = 0;
 
 connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) => {
   try {
+    // TES PAKSA: Print titik setiap ada log masuk
+    process.stdout.write(".");
+
     if (!hardMode.active) return;
     if (!logs.some(l => l.includes("Instruction: Create"))) return;
     if (seenSignatures.has(signature)) return;
@@ -452,7 +455,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
     const res = await analyze({ mint });
     
     // LOG DIBUKA TOTAL (Cerewet)
-    console.log(`analyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
+    console.log(`\nanalyze ${mint.slice(0,8)}: skor ${res.score} | ${res.reason}`);
 
     if (res.score >= SCORE_THRESHOLD) {
       const sig = await executeBuy(mint, buyAmount);
@@ -463,7 +466,7 @@ connection.onLogs(new PublicKey(PUMP_PROGRAM_ID), async ({ logs, signature }) =>
         `🔥 *BUY (SDK)* \`${mint.slice(0, 8)}\`\nAmount: *${buyAmount.toFixed(4)} SOL (~${fmtIdr(buyAmount)})*\nSkor: ${res.score}\n${res.reason}\ntx: \`${sig}\``,
         { parse_mode: "Markdown" });
     }
-  } catch (e) { console.error("onLogs error:", e.message); }
+  } catch (e) { console.error("\nonLogs error:", e.message); }
 }, "confirmed");
 
 // ============ BOT UI ============
@@ -642,4 +645,4 @@ reportLoop().catch(e => console.error("report crashed:", e.message));
 rateLoop().catch(e => console.error("rate crashed:", e.message));
 bot.catch((err, ctx) => console.error(`Telegraf ${ctx?.updateType}:`, err.message));
 bot.launch();
-console.log("📈 LANOX BOT RUNNING — FULL SDK ENGINE + IDR (CEREBET LOG) 📈");
+console.log("📈 LANOX BOT RUNNING — FULL SDK ENGINE + TES TITIK 📈");
